@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 _INTERNAL = frozenset(
     {
+        "activity",
         "attempt_progress",
         "base",
         "bus",
