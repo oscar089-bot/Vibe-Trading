@@ -84,10 +84,10 @@ def note(msg: str) -> None:
 
 
 def venv_dir() -> str:
-    override = os.environ.get("VIBE_TRADING_SMC_VENV")
+    override = os.environ.get("VIBE_TRADING_SMC_VENV")  # noqa: env-gate — standalone script, bootstrap-order independent
     if override:
         return override
-    root = os.environ.get("VIBE_TRADING_HOME") or os.path.join(
+    root = os.environ.get("VIBE_TRADING_HOME") or os.path.join(  # noqa: env-gate — standalone script, config layer not importable here
         os.path.expanduser("~"), ".vibe-trading"
     )
     return os.path.join(root, "tools", "smc-venv")
@@ -168,7 +168,7 @@ def build_venv(directory: str) -> None:
 
 def ensure_env(allow_bootstrap: bool) -> None:
     """Guarantee the deps are importable in THIS process, else re-exec."""
-    if os.environ.get("VIBE_TRADING_SMC_BOOTSTRAPPED"):
+    if os.environ.get("VIBE_TRADING_SMC_BOOTSTRAPPED"):  # noqa: env-gate — re-exec guard, must precede config import
         # We already re-executed once and still lack the deps: do not loop.
         die(install_hint(), 3)
 

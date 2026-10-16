@@ -45,7 +45,7 @@ def _keyring_dir() -> Path:
     volume persists it across recreation. ``VIBE_TRADING_KEYRING_DIR`` overrides
     the location outright.
     """
-    override = os.environ.get(_KEYRING_DIR_ENV_VAR, "").strip()
+    override = os.environ.get(_KEYRING_DIR_ENV_VAR, "").strip()  # noqa: env-gate — dynamic keyring dir override
     root = Path(override).expanduser() if override else get_runtime_root() / "secrets"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     return root
@@ -110,7 +110,7 @@ def _resolve_backend(keyring_module: Any) -> Any:
         pass
 
     current = keyring_module.get_keyring()
-    if os.environ.get("PYTHON_KEYRING_BACKEND", "").strip():
+    if os.environ.get("PYTHON_KEYRING_BACKEND", "").strip():  # noqa: env-gate — third-party keyring backend selector
         return current
     if not isinstance(current, non_functional):
         _pin_if_file_backend(current)
