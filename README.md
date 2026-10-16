@@ -52,6 +52,10 @@
 
 > ⚠️ **Security warning:** The X account `VibeTrading_HKU`, Virtuals project `101845`, and token contract `0x640BDBF77b6447E8b7DB7894cED84BD1c40571f4` are not official Vibe-Trading assets. We have never launched or endorsed any token or memecoin. Do not buy, connect a wallet, or sign anything. [Details](SECURITY.md#official-channels--impersonation).
 
+- **2026-10-16** 👁️ **Background market watchers: deterministic alerting with no LLM in the hot path**: A **watcher** is a market condition the agent arms on a pair — a price level, a zone retest, a candle close. A separate poll loop evaluates it against live prices with **no model call while the condition is false**, and the first time it becomes true it wakes the owning session to re-analyse and re-arm, alerting your IM channel in the same tick. A watcher is **authored through the `watcher_manager` tool** and rendered on a deterministic board (Web **Market Watchers** panel on the Scheduled page, or `/watchers` in Telegram), so what is being watched is never a mystery. **Authoring is guarded:** creation rejects an incomplete watcher before it is persisted — a source-prefixed pair (`yfinance|SOLUSD`), a timeframe the loader layer cannot serve (`2h`), a rule missing its numeric `level`/`side` or `low`/`high`, or an empty plain-English condition — and every rejection names the field and the fix, so the agent corrects and retries instead of arming a watcher that would poll and fail forever. **You choose the venue:** the model sets `source` (default **`yfinance`**; `okx`/`binance`/`ccxt` for exchange-native crypto, `tushare`/`akshare` for A-shares, `mt5` for local forex, or `auto` to route by market) — an unknown source is refused. In Telegram, **`/watchers` opens a self-updating board** that edits its message in place on the poll cadence (no cap on how many watchers it shows, cancelled on close/delete/shutdown). The runtime is **VPS-safe**: `.env` loading no longer stops at the first file that exists, so a flag that lived only in `agent/.env` is no longer silently shadowed by the Web-UI-written `~/.vibe-trading/.env`; the resolved source is logged once at startup.
+
+- **2026-10-16** 🧠 **Agent-loop reliability: batched resolution, untruncated payloads, replay over re-fetch**: The identity gate no longer forces a separate round trip per symbol — a symbol resolver and the calls that consume it can run in the **same assistant turn**, with the resolver locking identity before the consumers are authorized (a consumer placed *before* the resolver stays gated). Market-data and file reads now declare their **own delivery ceilings**: a full intraday OHLCV window and a 13k+ skill reference arrive **whole** instead of being cut mid-JSON or mid-sentence at the shared tool-result cap, and a read past the ceiling is **self-describing** (total/returned size, `next_offset`, resume hint). Market-data results evicted by context compaction are **restored from the run-scoped replay cache** rather than re-fetched. Spot FX and cash-index provenance now states that the `volume` column is **not a participation signal** (sources commonly report 0), so the agent stops chasing a number those markets never publish. The `custom` LLM provider startup check resolves its endpoint through the **credential vault**, so a working vault-backed provider is no longer reported as “base URL not set”. Telegram renders a single **in-place activity line** (braille spinner, action/failure counts, tool-name chips) that is created once, edited as the turn runs, and deleted when the answer lands. Headless hosts fall back to a file-backed credential vault when no OS keyring exists; bundled `smcpro` skill added.
+
 - **2026-10-13** 🧩 **Portfolio imports, strategy adaptation and research tools**: Read-only extraETF holdings imports support dated EUR valuation and allocation proposals; adapted strategies get their own backtest evidence ([#1170](https://github.com/HKUDS/Vibe-Trading/issues/1170), [#1149](https://github.com/HKUDS/Vibe-Trading/issues/1149)). Add tested custom model endpoints, a shared manual Pixel Office task board, Persian/Turkish UI, mStock read-only queries and Gildata research data.
   Fix settlement-currency accounting, Futu market selection and cost basis, per-symbol HK board lots, saved validation settings and run progress. Complete declared grounding checks and the agent-loop split. mStock remains excluded from portfolio aggregation; Robinhood options execution remains unavailable. See [CHANGELOG](CHANGELOG.md) for scope and limits.
 
@@ -355,6 +359,17 @@
         • Broker-journal behavior diagnostics<br>
         • Rule-based Shadow Account comparisons<br>
         • Exportable audit reports and strategy code
+      </div>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%" valign="top" colspan="2">
+      <h3>👁️ Background Market Watchers</h3>
+      <div align="left">
+        • Deterministic market conditions armed by the agent — evaluated on a poll loop with <b>no LLM in the hot path</b><br>
+        • Wakes the owning session and alerts your IM channel when the condition first becomes true<br>
+        • Guarded authoring: an incomplete watcher is refused before it is persisted, with the field and the fix<br>
+        • You pick the venue (<code>yfinance</code> default, <code>okx</code>/<code>binance</code>/<code>ccxt</code>/<code>tushare</code>/<code>akshare</code>/<code>mt5</code>/<code>auto</code>), and the board self-updates in the Web UI or on Telegram
       </div>
     </td>
   </tr>
@@ -668,16 +683,16 @@ Beyond OHLCV, **22 read-only data tools** reach into fundamentals & flow — fun
 Detailed inventories are folded below to keep the main README scannable. Open them when you want to inspect the available building blocks.
 
 <details>
-<summary><b>Finance Skill Library</b> <sub>90 skills across 9 categories</sub></summary>
+<summary><b>Finance Skill Library</b> <sub>91 skills across 9 categories</sub></summary>
 
-- 📊 90 specialized finance skills organized into 9 categories
+- 📊 91 specialized finance skills organized into 9 categories
 - 🌐 Complete coverage from traditional markets to crypto & DeFi
 - 🔬 Comprehensive capabilities spanning data sourcing to quantitative research
 
 | Category | Skills | Examples |
 |----------|--------|----------|
 | Data Source | 10 | `data-routing`, `tushare`, `yfinance`, `okx-market`, `akshare`, `mootdx`, `ccxt`, `eastmoney`, `sec-edgar`, `qveris` |
-| Strategy | 19 | `strategy-generate`, `cross-market-strategy`, `technical-basic`, `candlestick`, `ichimoku`, `elliott-wave`, `smc`, `multi-factor`, `ml-strategy` |
+| Strategy | 20 | `strategy-generate`, `cross-market-strategy`, `technical-basic`, `candlestick`, `ichimoku`, `elliott-wave`, `smc`, `smcpro`, `multi-factor`, `ml-strategy` |
 | Analysis | 23 | `factor-research`, `correlation-regime`, `macro-analysis`, `global-macro`, `valuation-model`, `investor-lenses`, `credit-analysis`, `dividend-analysis` |
 | Asset Class | 9 | `options-strategy`, `options-advanced`, `convertible-bond`, `etf-analysis`, `asset-allocation`, `sector-rotation` |
 | Crypto | 7 | `perp-funding-basis`, `liquidation-heatmap`, `stablecoin-flow`, `defi-yield`, `onchain-analysis` |
@@ -1671,6 +1686,45 @@ curl -X POST http://localhost:8899/scheduled-runs/playbooks/premarket-brief \
 
 Posting `{}` schedules a template on its own suggested cadence with its declared defaults. The rendered body becomes the job prompt verbatim, and an undeclared variable is rejected rather than silently ignored.
 
+### Background market watchers
+
+A **watcher** is a deterministic market condition the agent arms on a pair — a price level, a zone retest, a candle close — and hands to a separate poll loop. That loop evaluates the condition against live prices with **no model call while the condition is false**; the first time it becomes true it wakes the owning session to re-analyse and re-arm, and alerts the configured IM channel in the same tick. Nothing runs the LLM just to check whether a price moved.
+
+The watcher subsystem is **off by default**. Start the server with `VIBE_TRADING_ENABLE_WATCHER=1` to run the poll loop:
+
+```bash
+VIBE_TRADING_ENABLE_WATCHER=1 \
+VIBE_TRADING_WATCHER_CHANNEL=telegram \
+VIBE_TRADING_WATCHER_CHANNEL_TARGET=<chat id> \
+vibe-trading serve --port 8899
+```
+
+The agent authors a watcher through the **`watcher_manager`** tool (`create` / `update` / `delete`), and a watcher is rendered on a deterministic board — the **Market Watchers panel on the Scheduled page** in the web UI, or `/watchers` in Telegram. The board needs no model call to render, so the same state always produces the same card.
+
+**Creation is guarded.** A watcher that omits a critical detail is rejected *before* it is persisted, with a message that names the offending field and the fix, so the agent corrects and retries instead of arming a watcher that would poll and fail forever. The guard checks:
+
+- **Pair** — the bare symbol only. A source-prefixed pair such as `yfinance|SOLUSD` is refused; the source is a separate field, never a prefix.
+- **Timeframe** — one the loader layer can actually serve: `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`, `1w` (omit to default to `1d`). A `2h` watcher validates nowhere and would burn a fetch every tick.
+- **Trigger rule** — at least one fully-specified deterministic rule: numeric `level` + `side` (`above`/`below`) for level rules, or numeric `low`/`high` for zone rules. An `entry_zone` alone derives a `price_enters_zone` rule.
+- **Condition** — a plain-English `waiting_trigger`, so the board card and the wake prompt explain what is being watched without the rule table.
+
+**You choose the data source.** The model sets `source` to the venue its analysis used, so the watcher prices the same instrument you read:
+
+| Source | Typical use |
+|--------|-------------|
+| `yfinance` **(default)** | equities, forex, indices — no API key |
+| `yahoo` | the public Yahoo chart endpoint |
+| `okx` / `binance` / `ccxt` | exchange-native crypto pairs |
+| `tushare` / `akshare` | A-shares and China-market data |
+| `mt5` | a local MetaTrader 5 terminal |
+| `auto` | let the loader registry route by market |
+
+An unknown source is refused at creation. On the **Telegram board**, `/watchers` opens a message that **edits itself in place** on the poll cadence (`VIBE_TRADING_WATCHER_POLL_SECONDS`, default 30s) for as long as it is open — no re-press, and no cap on how many watchers it shows. Close, delete, or a bot shutdown cancels the refresh loop.
+
+Relevant environment variables: `VIBE_TRADING_ENABLE_WATCHER`, `VIBE_TRADING_WATCHER_POLL_SECONDS`, `VIBE_TRADING_WATCHER_FETCH_TIMEOUT_SECONDS`, `VIBE_TRADING_WATCHER_MAX_FETCHES_PER_TICK`, `VIBE_TRADING_WATCHER_CHANNEL`, `VIBE_TRADING_WATCHER_CHANNEL_TARGET`, `VIBE_TRADING_WATCHER_LLM_CONFIRMATION`. A watcher can also fire without an alert channel: leave `VIBE_TRADING_WATCHER_CHANNEL` unset and the session wake still happens.
+
+> **Heads-up on `.env` files (relevant on a VPS):** the loader reads **every** existing `.env` candidate — `~/.vibe-trading/.env`, then `agent/.env`, then `$CWD/.env` — and the **first** file that defines a key wins. If a flag looks present on disk but the app ignores it, check `~/.vibe-trading/.env` first: the web UI writes that file on any settings save, and it shadows `agent/.env` for every key it contains. A real exported environment variable always outranks all of them, and the resolved source is logged once at startup (`dotenv resolved from …`).
+
 ---
 
 ## 🔌 MCP Plugin
@@ -1776,7 +1830,7 @@ Browse on ClawHub: [clawhub.ai/skills/vibe-trading](https://clawhub.ai/skills/vi
 <details>
 <summary><b>OpenSpace — self-evolving skills</b></summary>
 
-All 90 finance skills are published on [open-space.cloud](https://open-space.cloud) and evolve autonomously through OpenSpace's self-evolution engine.
+All 91 finance skills are published on [open-space.cloud](https://open-space.cloud) and evolve autonomously through OpenSpace's self-evolution engine.
 
 To use with OpenSpace, add both MCP servers to your agent config:
 
@@ -1798,7 +1852,7 @@ To use with OpenSpace, add both MCP servers to your agent config:
 }
 ```
 
-OpenSpace will auto-discover all 90 skills, enabling auto-fix, auto-improve, and community sharing. Search for Vibe-Trading skills via `search_skills("finance backtest")` in any OpenSpace-connected agent.
+OpenSpace will auto-discover all 91 skills, enabling auto-fix, auto-improve, and community sharing. Search for Vibe-Trading skills via `search_skills("finance backtest")` in any OpenSpace-connected agent.
 
 </details>
 
@@ -2143,7 +2197,7 @@ Vibe-Trading/
 │   │   ├── agent/                  # ReAct agent core
 │   │   │   ├── loop.py             #   5-layer compression + read/write tool batching
 │   │   │   ├── context.py          #   system prompt + auto-recall from persistent memory
-│   │   │   ├── skills.py           #   skill loader (90 bundled + user-created via CRUD)
+│   │   │   ├── skills.py           #   skill loader (91 bundled + user-created via CRUD)
 │   │   │   ├── tools.py            #   tool base class + registry
 │   │   │   ├── memory.py           #   lightweight workspace state per run
 │   │   │   ├── frontmatter.py      #   shared YAML frontmatter parser
@@ -2152,7 +2206,7 @@ Vibe-Trading/
 │   │   ├── memory/                 # Cross-session persistent memory
 │   │   │   └── persistent.py       #   file-based memory (~/.vibe-trading/memory/)
 │   │   │
-│   │   ├── tools/                  # 112 auto-discovered agent tools
+│   │   ├── tools/                  # 126 auto-discovered agent tools
 │   │   │   ├── backtest_tool.py    #   run backtests
 │   │   │   ├── remember_tool.py    #   cross-session memory (save/recall/forget)
 │   │   │   ├── skill_writer_tool.py #  skill CRUD (save/patch/delete/file)
@@ -2170,7 +2224,7 @@ Vibe-Trading/
 │   │   ├── api/                    # FastAPI route modules
 │   │   │   └── alpha_routes.py     #   /alpha/list, /alpha/{id}, /alpha/bench, SSE stream
 │   │   │
-│   │   ├── skills/                 # 90 finance skills in 9 categories (SKILL.md each)
+│   │   ├── skills/                 # 91 finance skills in 9 categories (SKILL.md each)
 │   │   ├── swarm/                  # Swarm DAG execution engine
 │   │   │   └── presets/            #   30 swarm preset YAML definitions
 │   │   ├── session/                # Multi-turn chat + FTS5 session search

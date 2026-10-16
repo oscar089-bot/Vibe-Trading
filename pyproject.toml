@@ -208,6 +208,10 @@ keyring = [
     # it lazily and raises an actionable hint naming this extra, so a base
     # install stays lean for users who configure no local connector.
     "keyring>=25.0.0",
+    # Non-interactive file backend CredentialStore falls back to when no OS
+    # vault is reachable (headless servers, containers). Without it, keyring
+    # resolves to its non-functional ``fail`` sentinel and every save errors.
+    "keyrings.alt>=5.0.0",
 ]
 dingtalk = [
     "dingtalk-stream>=0.24.0",

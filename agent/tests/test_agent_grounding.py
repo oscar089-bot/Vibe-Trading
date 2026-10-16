@@ -361,10 +361,17 @@ def test_a_non_conclusive_re_resolution_cannot_retract_a_locked_symbol(
     assert ledger.authorized_symbols == {"AAA.US"}
 
 
-def test_resolver_and_consumer_in_same_batch_cannot_race(
+def test_resolver_first_in_same_batch_authorizes_the_consumer(
     tmp_path: Path,
 ) -> None:
-    """A consumer sees the identity snapshot from before its whole LLM batch."""
+    """A leading resolver locks identity before its batch-mates are authorized.
+
+    The gate used to freeze the identity snapshot before the whole batch, so a
+    resolver + consumer in one assistant turn always serialized into two round
+    trips. Now a LEADING resolver runs to completion and its identity is locked
+    before the consumers in the same batch are authorized — no race, because the
+    consumer is still dispatched only against an identity locked first.
+    """
     agent, resolver, market, _, trace = _build_direct_agent(
         tmp_path,
         _resolver_payload(),
@@ -376,7 +383,7 @@ def test_resolver_and_consumer_in_same_batch_cannot_race(
         [
             _tool_call("resolve", "search_symbol", query="机器人ETF"),
             _tool_call(
-                "prices-too-early",
+                "prices-same-batch",
                 "get_market_data",
                 codes=["562500.SH"],
                 start_date="2026-06-23",
@@ -389,33 +396,17 @@ def test_resolver_and_consumer_in_same_batch_cannot_race(
         react_trace,
         1,
     )
-
-    assert resolver.calls == 1
-    assert market.calls == 0
-    assert agent._grounding.authorized_symbols == {"562500.SH"}
-    blocked = [json.loads(message["content"]) for message in messages]
-    assert any(item.get("error_code") == "identity_required" for item in blocked)
-
-    agent._process_tool_calls(
-        [
-            _tool_call(
-                "prices-after-lock",
-                "get_market_data",
-                codes=["562500.SS"],
-                start_date="2026-06-23",
-                end_date="2026-06-24",
-                source="auto",
-            )
-        ],
-        ContextBuilder,
-        messages,
-        trace,
-        react_trace,
-        2,
-    )
     trace.close()
 
-    assert market.calls == 1
+    assert resolver.calls == 1
+    assert market.calls == 1, "a leading resolver authorizes the same-batch consumer"
+    assert agent._grounding.authorized_symbols == {"562500.SH"}
+    assert not any(
+        json.loads(message["content"]).get("error_code") == "identity_required"
+        for message in messages
+        if message.get("role") == "tool"
+        and message.get("name") == "get_market_data"
+    )
     artifact = json.loads(
         (tmp_path / "run" / "artifacts" / "grounding_evidence.json").read_text(
             encoding="utf-8"
@@ -432,10 +423,55 @@ def test_resolver_and_consumer_in_same_batch_cannot_race(
     )
 
 
-def test_market_sensitive_skill_waits_for_prior_identity_batch(
+def test_consumer_before_resolver_in_a_batch_is_still_gated(
     tmp_path: Path,
 ) -> None:
-    """Workflow selection cannot race the resolver in the same assistant turn."""
+    """The safety property survives: a consumer placed BEFORE the resolver is
+    not hoisted, so it is still authorized against the pre-batch snapshot and
+    blocked. Only a strict leading resolver prefix unlocks same-batch consumers.
+    """
+    agent, resolver, market, _, trace = _build_direct_agent(
+        tmp_path,
+        _resolver_payload(),
+    )
+    messages: list[dict[str, Any]] = []
+    react_trace: list[dict[str, Any]] = []
+
+    agent._process_tool_calls(
+        [
+            _tool_call(
+                "prices-first",
+                "get_market_data",
+                codes=["562500.SH"],
+                start_date="2026-06-23",
+                end_date="2026-06-24",
+            ),
+            _tool_call("resolve", "search_symbol", query="机器人ETF"),
+        ],
+        ContextBuilder,
+        messages,
+        trace,
+        react_trace,
+        1,
+    )
+    trace.close()
+
+    assert resolver.calls == 1
+    assert market.calls == 0, "a consumer before the resolver must stay blocked"
+    blocked = [json.loads(message["content"]) for message in messages]
+    assert any(item.get("error_code") == "identity_required" for item in blocked)
+
+
+def test_market_sensitive_skill_after_a_leading_resolver_runs_same_batch(
+    tmp_path: Path,
+) -> None:
+    """A leading resolver locks identity, so a same-batch workflow may load.
+
+    Workflow selection must not race the resolver — but once the resolver has
+    run and locked (here it is the batch's leading call), the identity is known
+    and ``load_skill`` is authorized in the same turn instead of forcing a
+    second round trip.
+    """
     agent, resolver, _, skill, trace = _build_direct_agent(tmp_path, _resolver_payload())
     messages: list[dict[str, Any]] = []
     react_trace: list[dict[str, Any]] = []
@@ -443,7 +479,32 @@ def test_market_sensitive_skill_waits_for_prior_identity_batch(
     agent._process_tool_calls(
         [
             _tool_call("resolve", "search_symbol", query="机器人ETF"),
+            _tool_call("workflow-same-batch", "load_skill", name="valuation-model"),
+        ],
+        ContextBuilder,
+        messages,
+        trace,
+        react_trace,
+        1,
+    )
+    trace.close()
+
+    assert resolver.calls == 1
+    assert skill.calls == 1, "a leading resolver authorizes the same-batch workflow"
+
+
+def test_market_sensitive_skill_before_the_resolver_stays_gated(
+    tmp_path: Path,
+) -> None:
+    """A workflow placed BEFORE the resolver is still refused in-batch."""
+    agent, resolver, _, skill, trace = _build_direct_agent(tmp_path, _resolver_payload())
+    messages: list[dict[str, Any]] = []
+    react_trace: list[dict[str, Any]] = []
+
+    agent._process_tool_calls(
+        [
             _tool_call("workflow-too-early", "load_skill", name="valuation-model"),
+            _tool_call("resolve", "search_symbol", query="机器人ETF"),
         ],
         ContextBuilder,
         messages,
@@ -454,19 +515,12 @@ def test_market_sensitive_skill_waits_for_prior_identity_batch(
 
     assert resolver.calls == 1
     assert skill.calls == 0
-    assert json.loads(messages[-1]["content"])["error_code"] == "identity_required"
-
-    agent._process_tool_calls(
-        [_tool_call("workflow-after-lock", "load_skill", name="valuation-model")],
-        ContextBuilder,
-        messages,
-        trace,
-        react_trace,
-        2,
-    )
-    trace.close()
-
-    assert skill.calls == 1
+    blocked = [
+        json.loads(message["content"])
+        for message in messages
+        if message.get("role") == "tool" and message.get("name") == "load_skill"
+    ]
+    assert blocked and blocked[0]["error_code"] == "identity_required"
 
 
 def test_argentina_symbols_have_grounding_identity() -> None:
@@ -1298,13 +1352,6 @@ class _CorrectingLLM:
             _Response(
                 tool_calls=[
                     _tool_call("resolve", "search_symbol", query="机器人ETF"),
-                    _tool_call(
-                        "too-early",
-                        "get_market_data",
-                        codes=["562500.SH"],
-                        start_date="2026-06-23",
-                        end_date="2026-06-24",
-                    ),
                 ]
             ),
             _Response(

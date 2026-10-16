@@ -111,6 +111,35 @@ def test_real_reasoning_tails_are_incremental_and_redaction_stays_private():
             sent.append(await bus.consume_outbound())
         reasoning = "".join(m.content for m in sent if m.metadata.get("_reasoning_delta"))
         assert reasoning == "Hello world"
-        assert any(m.content == "Reasoning…\n" for m in sent)
-        assert any(m.content == "Waiting for the model…\n" for m in sent)
+        # Status labels now render inside the activity panel (header + narration),
+        # so the label is a substring of the editable status line.
+        assert any("Reasoning…" in m.content for m in sent)
+        assert any("Waiting for the model…" in m.content for m in sent)
+    asyncio.run(scenario())
+
+
+def test_status_carries_activity_flag_and_clears_on_close():
+    """The live status must ride an ``_activity`` signal, and close must clear it.
+
+    A status sent as a plain stream delta accumulates in the answer buffer and
+    is never removed, so successive statuses stacked into one message. The
+    ``_activity`` flag lets a channel render one line it edits and deletes.
+    """
+    from src.channels.attempt_progress import AttemptProgress
+
+    async def scenario():
+        bus, events = MessageBus(), EventBus()
+        message = InboundMessage(channel="telegram", chat_id="c", sender_id="u", content="q", metadata={"_wants_stream": True})
+        progress = AttemptProgress(bus, events, message, "s", "a")
+        events.emit("s", "tool_call", {"tool": "get_market_data", "attempt_id": "a"})
+        await progress.poll()
+        status = await bus.consume_outbound()
+        assert status.metadata.get("_activity") is True
+        assert "get_market_data" in status.content
+        # close() must emit an activity-end so the line is removed.
+        await progress.close()
+        ends = []
+        while bus.outbound_size:
+            ends.append(await bus.consume_outbound())
+        assert any(m.metadata.get("_activity") and m.metadata.get("_activity_end") for m in ends)
     asyncio.run(scenario())

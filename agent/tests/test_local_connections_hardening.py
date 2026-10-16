@@ -132,6 +132,55 @@ def test_connection_modules_import_without_keyring_installed() -> None:
     assert "imported" in result.stdout.decode()
 
 
+def test_headless_host_falls_back_to_durable_file_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host with no OS vault must save to a durable file, not fail.
+
+    Reproduces the headless-server state -- keyring importable but resolved to
+    its non-functional ``fail`` sentinel -- that surfaced as "No recommended
+    backend was available" inside a save request. The store must engage the
+    non-interactive file fallback and write under ``VIBE_TRADING_KEYRING_DIR``,
+    the path a container volume persists.
+    """
+    keyring = pytest.importorskip("keyring")
+    pytest.importorskip("keyrings.alt.file")
+    from keyring.backends import fail
+
+    monkeypatch.delenv("PYTHON_KEYRING_BACKEND", raising=False)
+    monkeypatch.setenv("VIBE_TRADING_KEYRING_DIR", str(tmp_path / "secrets"))
+    monkeypatch.setattr(keyring, "get_keyring", lambda: fail.Keyring())
+    monkeypatch.setattr(keyring, "set_keyring", lambda backend: None)
+
+    store = CredentialStore()
+    store.save("headless", {"api_key": "sk-test"})
+    assert store.load("headless", ["api_key"]) == {"api_key": "sk-test"}
+    assert (tmp_path / "secrets" / "keyring_pass.cfg").exists()
+
+
+def test_headless_host_without_file_backend_names_the_cure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No vault and no file backend must name both cures, not keyring's own text."""
+    keyring = pytest.importorskip("keyring")
+    from keyring.backends import fail
+
+    real_import = builtins.__import__
+
+    def blocking_import(name, *args, **kwargs):
+        if name == "keyrings.alt.file" or name.startswith("keyrings.alt"):
+            raise ModuleNotFoundError("No module named 'keyrings.alt'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delenv("PYTHON_KEYRING_BACKEND", raising=False)
+    monkeypatch.setenv("VIBE_TRADING_KEYRING_DIR", str(tmp_path / "secrets"))
+    monkeypatch.setattr(keyring, "get_keyring", lambda: fail.Keyring())
+    monkeypatch.setattr(builtins, "__import__", blocking_import)
+
+    with pytest.raises(RuntimeError, match=r"keyrings\.alt|PYTHON_KEYRING_BACKEND"):
+        CredentialStore().save("headless", {"api_key": "sk-test"})
+
+
 # ---------------------------------------------------------------------------
 # Manifest discovery cache
 # ---------------------------------------------------------------------------

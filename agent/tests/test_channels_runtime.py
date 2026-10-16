@@ -988,6 +988,78 @@ def test_signal_group_command_requires_per_sender_authorization() -> None:
     assert allowed_chat == "group-1"
 
 
+@pytest.mark.parametrize("command", ["/stop", "/cancel", "/halt", "/STOP"])
+def test_stop_command_cancels_a_running_session(tmp_path, command):
+    """A stop must cancel the running turn, not be refused as a busy session.
+
+    The stop bypasses the session claim check, so it reaches
+    ``cancel_current`` even while the turn it targets holds the session.
+    """
+    async def scenario() -> None:
+        from src.channels.runtime import ChannelRuntime
+
+        bus = MessageBus()
+        service = FakeSessionService()
+        cancelled: list[str] = []
+        service.cancel_current = lambda sid: (cancelled.append(sid), True)[1]  # type: ignore[attr-defined]
+        runtime = ChannelRuntime(
+            bus=bus, session_service=service, manager=None,
+            session_map_path=tmp_path / "sessions.json", reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        await runtime.start(start_manager=False)
+        # Seed a session mapping for the chat, as a prior turn would have.
+        # Must happen after start(), which reloads the map from disk.
+        session = service.create_session(title="telegram:c1")
+        runtime._session_map["telegram:c1"] = session.session_id
+        try:
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="telegram", sender_id="u1", chat_id="c1",
+                    content=command, metadata={"message_id": "stop-1"},
+                )
+            )
+            reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert cancelled == [session.session_id]
+        assert reply.metadata.get("cancelled") is True
+        assert "Stopping" in reply.content
+        # The stop never reached the model as a chat turn.
+        assert service.sent == []
+
+    asyncio.run(scenario())
+
+
+def test_stop_command_without_a_session_is_a_noop(tmp_path):
+    """A stop for a chat with no running session says so and cancels nothing."""
+    async def scenario() -> None:
+        from src.channels.runtime import ChannelRuntime
+
+        bus = MessageBus()
+        service = FakeSessionService()
+        service.cancel_current = lambda sid: False  # type: ignore[attr-defined]
+        runtime = ChannelRuntime(
+            bus=bus, session_service=service, manager=None,
+            session_map_path=tmp_path / "sessions.json", reply_timeout_s=1,
+            poll_interval_s=0.01,
+        )
+        await runtime.start(start_manager=False)
+        try:
+            await bus.publish_inbound(
+                InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/stop")
+            )
+            reply = await asyncio.wait_for(bus.consume_outbound(), timeout=1)
+        finally:
+            await runtime.stop()
+
+        assert reply.metadata.get("cancelled") is False
+        assert "Nothing is running" in reply.content
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("fmt,label", [("html", "HTML"), ("pdf", "PDF"), (None, "plain text")])
 def test_channel_confirmation_displays_email_format(tmp_path, monkeypatch, fmt, label):
     from src.scheduled_research import proposals

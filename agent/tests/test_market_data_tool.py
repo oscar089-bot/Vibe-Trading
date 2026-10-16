@@ -237,6 +237,82 @@ def test_market_data_provenance_volume_unit_follows_serving_loader():
     assert prov["volume_unit"] == "shares"
 
 
+def test_market_data_provenance_flags_a_volumeless_fx_market():
+    """Spot FX provenance states volume is not a participation signal.
+
+    The agent kept re-fetching a USDJPY series to chase a volume number that
+    spot FX structurally does not publish (Yahoo returns 0 on every bar).
+    Provenance now says so, so the model stops spending calls on it.
+    """
+    idx = pd.date_range("2026-01-01", periods=1, freq="D")
+    idx.name = "trade_date"
+    df = pd.DataFrame(
+        {
+            "open": [1.0],
+            "high": [1.1],
+            "low": [0.9],
+            "close": [1.05],
+            "volume": [0.0],
+        },
+        index=idx,
+    )
+
+    class _FxLoader:
+        def fetch(self, codes, start, end, interval="1D"):
+            return {codes[0]: df}
+
+    payload = json.loads(
+        fetch_market_data_json(
+            codes=["USDJPY=X"],
+            start_date="2026-01-01",
+            end_date="2026-01-02",
+            source="yahoo",
+            loader_resolver=lambda src: _FxLoader,
+            fallback_chain_provider=lambda source: ["yahoo"],
+            include_provenance=True,
+        )
+    )
+
+    note = payload["_provenance"]["USDJPY=X"].get("volume_note")
+    assert note and "no centralised exchange volume" in note
+
+
+def test_market_data_provenance_leaves_equity_volume_unflagged():
+    """An equity market's volume is meaningful, so no volume_note is added."""
+    idx = pd.date_range("2026-01-01", periods=1, freq="D")
+    idx.name = "trade_date"
+    df = pd.DataFrame(
+        {
+            "open": [1.0],
+            "high": [1.1],
+            "low": [0.9],
+            "close": [1.05],
+            "volume": [100],
+        },
+        index=idx,
+    )
+
+    class _EqLoader:
+        volume_units = {"us_equity": "shares"}
+
+        def fetch(self, codes, start, end, interval="1D"):
+            return {codes[0]: df}
+
+    payload = json.loads(
+        fetch_market_data_json(
+            codes=["AAPL.US"],
+            start_date="2026-01-01",
+            end_date="2026-01-02",
+            source="yahoo",
+            loader_resolver=lambda src: _EqLoader,
+            fallback_chain_provider=lambda source: ["yahoo"],
+            include_provenance=True,
+        )
+    )
+
+    assert "volume_note" not in payload["_provenance"]["AAPL.US"]
+
+
 def test_market_data_json_is_strict_when_loader_returns_nan():
 
     idx = pd.date_range("2026-01-01", periods=1, freq="D")

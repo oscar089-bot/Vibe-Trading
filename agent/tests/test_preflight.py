@@ -75,6 +75,48 @@ def test_llm_preflight_probe_reports_request_errors(monkeypatch) -> None:
     assert "Timeout: timed out" in result.message
 
 
+def test_llm_preflight_reports_a_crashing_diagnostic_instead_of_raising(monkeypatch) -> None:
+    """A misconfigured provider must be reported, never propagated.
+
+    ``provider_diagnostics`` raises when a custom profile is active but has no
+    stored key. That used to escape preflight and abort server startup -- the
+    one state an operator most needs the Web UI reachable to repair.
+    """
+    import src.providers.llm as llm
+
+    monkeypatch.setenv("LANGCHAIN_PROVIDER", "custom")
+    monkeypatch.setenv("LANGCHAIN_MODEL_NAME", "deepseek-default")
+    monkeypatch.setattr(llm, "_ensure_dotenv", lambda: None)
+    monkeypatch.setattr(llm, "_sync_provider_env", lambda: None)
+
+    def boom() -> dict:
+        raise ValueError("Custom provider profile has no API key: freedeepseek")
+
+    monkeypatch.setattr(llm, "provider_diagnostics", boom)
+
+    result = preflight._check_llm_provider()
+
+    assert result.status == "error"
+    assert result.critical is True
+    assert "no API key" in result.message
+
+
+def test_run_preflight_never_aborts_on_a_crashing_check(monkeypatch) -> None:
+    """One bad check must degrade to an error row, not stop the whole table."""
+    def boom() -> preflight.CheckResult:
+        raise RuntimeError("diagnostic exploded")
+
+    monkeypatch.setattr(preflight, "_check_llm_provider", boom)
+
+    results = preflight.run_preflight()
+
+    failed = [r for r in results if r.status == "error"]
+    assert failed, "a crashing check must surface as an error result"
+    assert "check crashed" in failed[0].message
+    # The remaining checks still ran and reported.
+    assert len(results) > 1
+
+
 def test_copilot_preflight_uses_sdk_auth_instead_of_openai_base_url(
     monkeypatch,
 ) -> None:

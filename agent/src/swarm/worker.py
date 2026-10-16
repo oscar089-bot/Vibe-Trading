@@ -19,7 +19,7 @@ from src.agent.context import ContextBuilder
 from src.agent.progress import HeartbeatTimer
 from src.agent.skills import SkillsLoader
 from src.agent.tools import BaseTool, ToolRegistry
-from src.config.limits import truncate_tool_result
+from src.config.limits import resolve_result_limit, truncate_tool_result
 from src.config.schema import AgentConfig
 from src.providers.chat import ChatLLM, LLMResponse, ProviderStreamError
 from src.providers.content_filter import (
@@ -1044,7 +1044,14 @@ def _run_worker_impl(
             )
             messages.append(
                 ContextBuilder.format_tool_result(
-                    tc.id, tc.name, truncate_tool_result(result)
+                    tc.id,
+                    tc.name,
+                    truncate_tool_result(
+                        result,
+                        resolve_result_limit(
+                            getattr(registry.get(tc.name), "result_limit", None)
+                        ),
+                    ),
                 )
             )
 

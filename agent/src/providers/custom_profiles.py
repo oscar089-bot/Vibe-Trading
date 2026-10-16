@@ -69,7 +69,19 @@ class CustomProviderStore:
             payload = self._read()
             profiles = payload.setdefault("profiles", {})
             if payload.get("active_id") == profile_id:
-                raise ValueError("Save changes under a new id before activating the updated profile")
+                # An active profile normally keeps its identity stable, so edits
+                # go under a new id. The exception is a profile that is active
+                # but has no stored key (a half-finished save, e.g. an earlier
+                # vault failure): re-saving it with a key is a repair, not a
+                # redefinition, and refusing would strand the server with an
+                # active provider it cannot resolve.
+                stored = self.credentials.load(
+                    f"custom-provider:{profile_id}", ["api_key"]
+                ).get("api_key", "")
+                if stored:
+                    raise ValueError(
+                        "Save changes under a new id before activating the updated profile"
+                    )
             profiles[profile_id] = {
                 "label": label.strip(),
                 "base_url": base_url.strip().rstrip("/"),

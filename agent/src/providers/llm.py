@@ -842,7 +842,9 @@ else:
 
 AGENT_DIR = Path(__file__).resolve().parents[2]
 
-# .env search order: ~/.vibe-trading/.env → agent/.env → $CWD/.env
+# .env search order: ~/.vibe-trading/.env → agent/.env → $CWD/.env.
+# ALL existing candidates are loaded (see _ensure_dotenv); the first that
+# defines a key wins, later ones only fill keys it left unset.
 _ENV_CANDIDATES = [
     Path.home() / ".vibe-trading" / ".env",
     AGENT_DIR / ".env",
@@ -1364,16 +1366,32 @@ def _load_env_file(path: Path) -> None:
 
 
 def _ensure_dotenv() -> None:
-    """Load `.env` from the first found candidate path."""
+    """Load EVERY existing `.env` candidate into os.environ.
+
+    Candidates are applied in order (``~/.vibe-trading/.env`` → ``agent/.env``
+    → ``$CWD/.env``). :func:`_load_env_file` uses ``override=False``, so the
+    FIRST file that defines a key wins and later files only fill keys an
+    earlier one left unset.
+
+    Loading all candidates — rather than stopping at the first that exists —
+    fixes a silent-shadowing trap: when ``~/.vibe-trading/.env`` exists (the
+    Web UI writes it on any settings save), every key that lived only in
+    ``agent/.env`` was unreachable. A flag such as
+    ``VIBE_TRADING_ENABLE_WATCHER=1`` set in the lower-precedence file looked
+    present on disk yet never reached ``os.environ``. Precedence is unchanged
+    (first file still wins for duplicates); only previously-unreachable keys
+    now load.
+    """
     global _dotenv_loaded
     if _dotenv_loaded:
         return
     loaded = None
     for candidate in _ENV_CANDIDATES:
-        if candidate.exists():
-            _load_env_file(candidate)
+        if not candidate.exists():
+            continue
+        _load_env_file(candidate)
+        if loaded is None:
             loaded = candidate
-            break
     if loaded is not None:
         reset_env_config()
     _dotenv_loaded = True

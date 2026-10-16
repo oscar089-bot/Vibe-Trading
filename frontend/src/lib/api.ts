@@ -557,6 +557,30 @@ export const api = {
       `/scheduled-runs/proposals/${encodeURIComponent(proposalId)}/discard`,
       { method: "POST" },
     ),
+  // Watchers: deterministic market-condition monitors. The board is a read-only
+  // projection of state the poll loop already wrote, so listing is O(1).
+  getWatcherBoard: (includeTerminal = false, signal?: AbortSignal) =>
+    request<WatcherBoardResponse>(
+      `/watcher-board?include_terminal=${includeTerminal ? "true" : "false"}`,
+      { signal },
+    ),
+  getWatcher: (watcherId: string) =>
+    request<WatcherDetailResponse>(`/watchers/${encodeURIComponent(watcherId)}`),
+  cancelWatcher: (watcherId: string) =>
+    request<{ status: string; watcher: WatcherBoardItem }>(
+      `/watchers/${encodeURIComponent(watcherId)}/cancel`,
+      { method: "POST" },
+    ),
+  pauseWatcher: (watcherId: string) =>
+    request<{ status: string; watcher: WatcherBoardItem }>(
+      `/watchers/${encodeURIComponent(watcherId)}/pause`,
+      { method: "POST" },
+    ),
+  deleteWatcher: (watcherId: string) =>
+    request<{ status: string; deleted: boolean }>(
+      `/watchers/${encodeURIComponent(watcherId)}`,
+      { method: "DELETE" },
+    ),
   sendMessage: (sid: string, content: string) => request<{ message_id: string; attempt_id: string }>(`/sessions/${sid}/messages`, { method: "POST", body: JSON.stringify({ content }) }),
   cancelSession: (sid: string) => request<{ status: string }>(`/sessions/${sid}/cancel`, { method: "POST" }),
   getSessionMessages: (sid: string) => request<MessageItem[]>(`/sessions/${sid}/messages`),
@@ -800,6 +824,76 @@ export interface ScheduledRun {
   // The latest run's parsed verdict, embedded with its predecessor so the list
   // renders a delta in one query. Null until a completed run records one.
   last_verdict: VerdictRecord | null;
+}
+
+// --- Watchers ---
+
+export interface WatcherEntryZone {
+  low: number;
+  high: number;
+}
+
+export interface WatcherRule {
+  type: string;
+  side?: "above" | "below";
+  level?: number;
+  low?: number;
+  high?: number;
+  timeframe?: string;
+  id?: string;
+}
+
+export interface WatcherBoardItem {
+  id: string;
+  pair: string;
+  asset_class: string;
+  direction: string;
+  timeframe: string;
+  /** Market-data venue the watcher polls through; 'yfinance' when unset. */
+  source: string;
+  status: string;
+  kind: string;
+  entry_zone: WatcherEntryZone | null;
+  waiting_trigger: string;
+  trigger_rules: WatcherRule[];
+  invalidation_rules: WatcherRule[];
+  analysis_context: Record<string, unknown>;
+  session_id: string | null;
+  is_pollable: boolean;
+  last_price: number | null;
+  last_checked: string | null;
+  last_market_timestamp: string | null;
+  last_event: string | null;
+  armed_at: string | null;
+  terminal: boolean;
+  error_count: number;
+  last_error: string | null;
+  alerted_conditions: Record<string, string>;
+  fired_conditions: Record<string, string>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WatcherBoardResponse {
+  enabled: boolean;
+  running: boolean;
+  watchers: WatcherBoardItem[];
+  count: number;
+}
+
+export interface WatcherEventRecord {
+  watcher_id: string;
+  event_type: string;
+  message: string;
+  condition_key: string | null;
+  price: number | null;
+  data: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface WatcherDetailResponse {
+  watcher: WatcherBoardItem;
+  events: WatcherEventRecord[];
 }
 
 export interface CreateScheduledRunRequest {

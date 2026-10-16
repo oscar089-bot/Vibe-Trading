@@ -213,6 +213,42 @@ def test_parallel_saves_retain_every_profile(custom_store):
     assert len(custom_store.list_public()) == 12
 
 
+def test_active_keyless_profile_can_be_repaired(custom_store):
+    """An active profile with no stored key must be re-savable.
+
+    A half-finished save (e.g. an earlier vault failure) can leave a profile
+    marked active with no key, which makes the runtime unresolvable. Re-saving
+    it is a repair, not a redefinition, so it must not be refused.
+    """
+    # Construct the broken state directly: metadata present, active, no key.
+    custom_store._write(
+        {
+            "profiles": {
+                "freedeepseek": {
+                    "label": "Free",
+                    "base_url": "https://free.test/v1",
+                    "model": "deepseek-default",
+                }
+            },
+            "active_id": "freedeepseek",
+        }
+    )
+    assert custom_store.credentials.status("custom-provider:freedeepseek", ["api_key"])["api_key"] is False
+
+    custom_store.save(profile_id="freedeepseek", label="Free", base_url="https://free.test/v1", model="deepseek-default", api_key="sk-test")
+
+    assert custom_store.get("freedeepseek")["api_key"] == "sk-test"
+
+
+def test_active_profile_with_a_key_still_requires_a_new_id(custom_store):
+    """The original guard stays in force for a healthy active profile."""
+    custom_store.save(profile_id="alpha", label="Alpha", base_url="https://alpha.test/v1", model="alpha", api_key="alpha-key")
+    custom_store._write({**custom_store._read(), "active_id": "alpha"})
+
+    with pytest.raises(ValueError, match="new id"):
+        custom_store.save(profile_id="alpha", label="Alpha", base_url="https://alpha.test/v1", model="alpha", api_key="alpha-key-2")
+
+
 def test_full_completion_url_normalizes_to_the_runtime_api_root():
     assert custom_provider_routes._validate_custom_base_url("https://example.test/v1/chat/completions/") == "https://example.test/v1"
     with pytest.raises(ValueError):

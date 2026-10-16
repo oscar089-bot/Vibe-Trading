@@ -508,6 +508,27 @@ class AgentTuningConfig(_EnvBase):
     vibe_trading_channels_auto_start: EnvBool = Field(
         alias="VIBE_TRADING_CHANNELS_AUTO_START", default=False,
     )
+    vibe_trading_enable_watcher: EnvBool = Field(
+        alias="VIBE_TRADING_ENABLE_WATCHER", default=False,
+    )
+    vibe_trading_watcher_poll_seconds: float = Field(
+        alias="VIBE_TRADING_WATCHER_POLL_SECONDS", default=30.0,
+    )
+    vibe_trading_watcher_fetch_timeout_seconds: float = Field(
+        alias="VIBE_TRADING_WATCHER_FETCH_TIMEOUT_SECONDS", default=20.0,
+    )
+    vibe_trading_watcher_max_fetches_per_tick: int = Field(
+        alias="VIBE_TRADING_WATCHER_MAX_FETCHES_PER_TICK", default=50,
+    )
+    vibe_trading_watcher_channel: str = Field(
+        alias="VIBE_TRADING_WATCHER_CHANNEL", default="",
+    )
+    vibe_trading_watcher_channel_target: str = Field(
+        alias="VIBE_TRADING_WATCHER_CHANNEL_TARGET", default="",
+    )
+    vibe_trading_watcher_llm_confirmation: EnvBool = Field(
+        alias="VIBE_TRADING_WATCHER_LLM_CONFIRMATION", default=False,
+    )
     vibe_trading_disable_bottleneck: EnvBool = Field(
         alias="VIBE_TRADING_DISABLE_BOTTLENECK", default=False,
     )

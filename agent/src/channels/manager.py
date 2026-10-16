@@ -484,6 +484,17 @@ class ChannelManager:
                         await self._send_with_retry(channel, msg)
                     continue
 
+                # Live activity line: a single editable status the channel
+                # owns, cleared when the turn ends. Only adapters that render
+                # one in place (Telegram) take this route; everything else falls
+                # through to its own progress/stream handling below.
+                if msg.metadata.get("_activity"):
+                    activity_channel = self.channels.get(msg.channel)
+                    if activity_channel is not None and activity_channel.overrides_send_activity():
+                        if activity_channel.send_progress:
+                            await self._send_with_retry(activity_channel, msg)
+                        continue
+
                 # Progress / tool-hint filtering
                 if msg.metadata.get("_progress"):
                     if msg.metadata.get("_tool_hint") and not self._should_send_progress(
@@ -533,7 +544,9 @@ class ChannelManager:
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send one outbound message without retry policy."""
-        if msg.metadata.get("_reasoning_end"):
+        if msg.metadata.get("_activity") and channel.overrides_send_activity():
+            await channel.send_activity(msg.chat_id, msg.content, msg.metadata)
+        elif msg.metadata.get("_reasoning_end"):
             await channel.send_reasoning_end(msg.chat_id, msg.metadata)
         elif msg.metadata.get("_reasoning_delta"):
             await channel.send_reasoning_delta(msg.chat_id, msg.content, msg.metadata)

@@ -9,8 +9,45 @@ dependency on the others.
 
 from __future__ import annotations
 
-#: Maximum characters of a single tool result handed back to the model.
+#: Default maximum characters of a single tool result handed back to the model.
+#: A tool may raise its own ceiling via ``BaseTool.result_limit`` when its
+#: natural payload is legitimately larger (a full intraday OHLCV window);
+#: ``resolve_result_limit`` is the single place that mapping is read.
 TOOL_RESULT_LIMIT = 10_000
+
+#: Delivery ceiling for ``get_market_data``. A full intraday OHLCV window
+#: (250 rows, 4H/1H/15m) is ~23-47k compact characters — well past the shared
+#: 10k default — so the default downsampled the series and the model computed
+#: structure on a partial window without knowing it. The market-data tool
+#: raises its own ceiling here so the complete window is delivered intact.
+#: Context growth is still governed by the compaction layers; this widens the
+#: per-result cut point, it does not remove the budget.
+MARKET_DATA_RESULT_LIMIT = 48_000
+
+#: Delivery ceiling for ``read_file``. The tool's own ``_OUTPUT_LIMIT`` caps a
+#: single read at 50_000 characters; the shared 10_000 default cut a 13.4k
+#: skill reference (smcpro/references/analysis.md, Step 5's ACTIVE volume
+#: threshold) mid-sentence, because the JSON envelope wrapping the content
+#: pushed it past the shared cap. The ceiling clears ``_OUTPUT_LIMIT`` plus the
+#: envelope so a document the model explicitly asked to read arrives whole;
+#: anything larger is paged via the tool's ``offset`` parameter.
+READ_FILE_RESULT_LIMIT = 64_000
+
+
+def resolve_result_limit(explicit: int | None) -> int:
+    """Return the effective delivery cap for a tool.
+
+    Args:
+        explicit: A tool's ``result_limit`` (``None`` uses the shared default).
+
+    Returns:
+        The positive character cap to apply, or ``TOOL_RESULT_LIMIT`` when the
+        tool declares none. A non-positive value is treated as unset so a
+        misconfigured attribute can never cut every result to nothing.
+    """
+    if isinstance(explicit, int) and explicit > 0:
+        return explicit
+    return TOOL_RESULT_LIMIT
 
 _TRUNCATION_NOTICE = (
     "\n\n[TRUNCATED: {shown} of {total} characters delivered. The remainder was "

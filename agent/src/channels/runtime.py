@@ -183,74 +183,17 @@ class ChannelRuntime:
                 )
                 return
 
+            if self._is_stop_command(msg.content):
+                # A stop must be honoured while the turn it targets is running.
+                # Without this, /stop reached send_message(), hit the busy claim
+                # and was answered with "still working" — so the command never
+                # cancelled anything.
+                await self._handle_stop(msg, self._session_map.get(msg.session_key))
+                return
             session_id = self._session_for(msg)
             if await self._handle_scheduled_confirmation(msg, session_id):
                 return
-            result = await self.session_service.send_message(
-                session_id,
-                msg.content,
-                include_shell_tools=False,
-            )
-            attempt_id = result.get("attempt_id") if isinstance(result, dict) else None
-            from src.channels.attempt_progress import AttemptProgress
-
-            events = getattr(self.session_service, "event_bus", None)
-            progress = (AttemptProgress(self.bus, events, msg, session_id, attempt_id)
-                        if events is not None and attempt_id else None)
-            try:
-                reply = await self._wait_for_reply(session_id, attempt_id, progress=progress)
-            finally:
-                if progress is not None:
-                    await progress.close()
-            reply_content = reply.content
-            try:
-                from src.scheduled_research.proposals import latest_pending_for_session
-
-                proposal = latest_pending_for_session(session_id)
-            except Exception:  # noqa: BLE001 - confirmation UI must not hide the reply
-                proposal = None
-            if proposal is not None:
-                job = proposal.get("job") or {}
-                schedule = job.get("schedule") or {}
-                delivery = job.get("delivery") or {}
-                action = "create" if proposal.get("operation") == "create" else "cancel"
-                email_format = ""
-                if delivery.get("channel") == "email":
-                    label = {"html": "HTML", "pdf": "PDF"}.get(delivery.get("format"), "plain text")
-                    email_format = f"Email format: {label}\n"
-                    if delivery.get("format") == "pdf":
-                        protection = "on" if delivery.get("protect_pdf") is True else "off"
-                        email_format += f"PDF password protection: {protection}\n"
-                reply_content = (
-                    f"{reply_content}\n\n"
-                    f"[Scheduled research confirmation · {action}]\n"
-                    f"Task: {job.get('title') or job.get('id') or '?'}\n"
-                    f"Schedule: {schedule.get('expression') or '-'} · "
-                    f"{schedule.get('timezone') or 'UTC'}\n"
-                    f"Delivery: {delivery.get('target_label') or 'in-app only'}\n"
-                    f"{email_format}"
-                    'Reply exactly "confirm" (确认) to commit, or "cancel" (取消) '
-                    "to discard."
-                )
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=reply_content,
-                    media=self._report_media(reply),
-                    metadata={
-                        "_channel_runtime": True,
-                        "attempt_id": attempt_id,
-                        "session_id": session_id,
-                        **{key: msg.metadata[key] for key in ("chat_type", "root_id") if key in msg.metadata},
-                        # QQ (and other platforms) need the originating message id
-                        # to reply as a passive message; without it, replies are
-                        # treated as active messages and rejected for
-                        # non-privileged bots.
-                        "message_id": msg.metadata.get("message_id"),
-                    },
-                )
-            )
+            await self._dispatch_turn(msg, session_id)
         except asyncio.CancelledError:
             raise
         except SessionBusyError:
@@ -286,6 +229,109 @@ class ChannelRuntime:
                     },
                 )
             )
+
+    @staticmethod
+    def _is_stop_command(content: str) -> bool:
+        """True for the user-facing stop aliases a running turn must honour."""
+        return content.strip().lower() in {"/stop", "/cancel", "/halt"}
+
+    async def _handle_stop(self, msg: InboundMessage, session_id: str | None) -> None:
+        """Cancel a session's running turn and confirm it to the user.
+
+        Dispatched before the session is claimed, so it lands while the turn it
+        targets is still running — which is the only time a stop is useful.
+        """
+        cancelled = False
+        if session_id is not None:
+            try:
+                cancelled = bool(self.session_service.cancel_current(session_id))
+            except Exception:  # noqa: BLE001 - a cancel failure must still be reported
+                logger.exception("Failed to cancel session %s", session_id)
+        content = (
+            "\U0001f6d1 Stopping the current task\u2026"
+            if cancelled
+            else "\u2139\ufe0f Nothing is running right now."
+        )
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                metadata={
+                    "_channel_runtime": True,
+                    "cancelled": cancelled,
+                    "message_id": msg.metadata.get("message_id"),
+                },
+            )
+        )
+
+    async def _dispatch_turn(self, msg: InboundMessage, session_id: str) -> None:
+        """Send one message to the session and publish the eventual reply."""
+        result = await self.session_service.send_message(
+            session_id,
+            msg.content,
+            include_shell_tools=False,
+        )
+        attempt_id = result.get("attempt_id") if isinstance(result, dict) else None
+        from src.channels.attempt_progress import AttemptProgress
+
+        events = getattr(self.session_service, "event_bus", None)
+        progress = (AttemptProgress(self.bus, events, msg, session_id, attempt_id)
+                    if events is not None and attempt_id else None)
+        try:
+            reply = await self._wait_for_reply(session_id, attempt_id, progress=progress)
+        finally:
+            if progress is not None:
+                await progress.close()
+        reply_content = reply.content
+        try:
+            from src.scheduled_research.proposals import latest_pending_for_session
+
+            proposal = latest_pending_for_session(session_id)
+        except Exception:  # noqa: BLE001 - confirmation UI must not hide the reply
+            proposal = None
+        if proposal is not None:
+            job = proposal.get("job") or {}
+            schedule = job.get("schedule") or {}
+            delivery = job.get("delivery") or {}
+            action = "create" if proposal.get("operation") == "create" else "cancel"
+            email_format = ""
+            if delivery.get("channel") == "email":
+                label = {"html": "HTML", "pdf": "PDF"}.get(delivery.get("format"), "plain text")
+                email_format = f"Email format: {label}\n"
+                if delivery.get("format") == "pdf":
+                    protection = "on" if delivery.get("protect_pdf") is True else "off"
+                    email_format += f"PDF password protection: {protection}\n"
+            reply_content = (
+                f"{reply_content}\n\n"
+                f"[Scheduled research confirmation · {action}]\n"
+                f"Task: {job.get('title') or job.get('id') or '?'}\n"
+                f"Schedule: {schedule.get('expression') or '-'} · "
+                f"{schedule.get('timezone') or 'UTC'}\n"
+                f"Delivery: {delivery.get('target_label') or 'in-app only'}\n"
+                f"{email_format}"
+                'Reply exactly "confirm" (确认) to commit, or "cancel" (取消) '
+                "to discard."
+            )
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=reply_content,
+                media=self._report_media(reply),
+                metadata={
+                    "_channel_runtime": True,
+                    "attempt_id": attempt_id,
+                    "session_id": session_id,
+                    **{key: msg.metadata[key] for key in ("chat_type", "root_id") if key in msg.metadata},
+                    # QQ (and other platforms) need the originating message id
+                    # to reply as a passive message; without it, replies are
+                    # treated as active messages and rejected for
+                    # non-privileged bots.
+                    "message_id": msg.metadata.get("message_id"),
+                },
+            )
+        )
 
     async def _handle_scheduled_confirmation(
         self, msg: InboundMessage, session_id: str

@@ -9,6 +9,8 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from src.config.limits import TOOL_RESULT_LIMIT
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_ROWS = 250
@@ -165,6 +167,41 @@ def _ca_venue_sibling(code: str) -> str | None:
     return f"{match.group('base')}.{sibling}"
 
 
+#: Markets whose ``volume`` column carries no participation signal because the
+#: instrument trades OTC / is an index level, so no centralised volume exists.
+#: A spot FX pair has no exchange at all — Yahoo reports ``volume = 0`` on
+#: every bar — and a cash index is a computed level, not a traded thing. An
+#: agent that reads ``volume`` on these keeps re-fetching to chase a number the
+#: source can never publish; provenance states the limitation so it stops.
+_VOLUMELESS_MARKETS: dict[str, str] = {
+    "forex": (
+        "Spot FX has no centralised exchange volume; the 'volume' column is "
+        "NOT real participation (sources commonly report 0). Do not use it "
+        "for volume confirmation — use a CME FX futures proxy or drop volume "
+        "from the confluence."
+    ),
+    "index": (
+        "A cash index is a computed level, not a traded instrument; the "
+        "'volume' column carries no participation signal. Do not use it for "
+        "volume confirmation."
+    ),
+}
+
+
+def _volume_availability_note(market: str | None) -> str | None:
+    """A provenance warning when a market structurally lacks volume, else None.
+
+    Args:
+        market: Market name as ``_detect_market`` returns it.
+
+    Returns:
+        A one-sentence explanation for a volumeless market, or ``None`` for
+        every market whose volume column is meaningful (so equity/crypto
+        provenance is unchanged).
+    """
+    return _VOLUMELESS_MARKETS.get((market or "").strip().lower())
+
+
 def cap_rows(records: list, max_rows: int) -> list | dict[str, object]:
     """Bound a per-symbol row list to keep tool payloads within budget."""
     n = len(records)
@@ -184,6 +221,95 @@ def cap_rows(records: list, max_rows: int) -> list | dict[str, object]:
         "hint": "narrow the date range, coarsen interval, or set max_rows=0 for all rows",
         "data": sampled,
     }
+
+
+def _fit_payload_to_budget(payload: dict[str, Any], budget: int | None = None) -> dict[str, Any]:
+    """Shrink per-symbol rows until the compact JSON fits the tool budget.
+
+    ``cap_rows`` bounds rows by COUNT (250), which is right for daily bars but
+    wrong for intraday: a 4H/1H/15m row is the same size as a daily one, so 250
+    of them is 4-5x the character budget and the agent loop's hard cut chopped
+    the JSON mid-series — the model received a truncated prefix it could not
+    tell apart from a complete window. This bounds by the SERIALIZED size
+    instead, which is the unit the cut actually measures.
+
+    Reuses :func:`cap_rows`, so a size-driven downsample carries exactly the
+    same shape and policy as a count-driven one — same ``every-Nth-row``
+    stride, same last-bar pin, same ``truncated``/``rows``/``returned`` keys.
+    One contract, two triggers.
+
+    The character budget is authoritative even for ``max_rows=0``. That option
+    means "no row-count cap", not "exceed the transport limit": a payload past
+    the budget is cut mid-JSON downstream, which is strictly worse than a
+    labelled downsample the model can read and act on.
+
+    Args:
+        payload: Assembled ``fetch_market_data`` result (symbols + ``_*`` keys).
+        budget: Maximum serialized characters to produce.
+
+    Returns:
+        The payload unchanged when it already fits, otherwise a copy whose
+        oversized symbols carry truncation metadata, or the 1-row shape when
+        even that cannot fit.
+    """
+    # Resolved at call time (not as a default arg) so the budget stays the one
+    # live constant a test or an operator can retune.
+    if budget is None:
+        budget = TOOL_RESULT_LIMIT
+
+    def dump(candidate: dict[str, Any]) -> str:
+        return json.dumps(candidate, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+    if len(dump(payload)) <= budget:
+        return payload
+
+    data_keys = [key for key in payload if not str(key).startswith("_")]
+
+    def rows_of(value: Any) -> list | None:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict) and isinstance(value.get("data"), list):
+            return value["data"]
+        return None
+
+    counts = {key: len(rows_of(payload[key]) or []) for key in data_keys}
+    counts = {key: n for key, n in counts.items() if n}
+    if not counts:
+        return payload
+
+    def original_count(value: Any, rows: list) -> int:
+        """The symbol's true row count, even when ``value`` is a capped dict."""
+        if isinstance(value, dict):
+            declared = value.get("rows")
+            if isinstance(declared, int) and declared >= len(rows):
+                return declared
+        return len(rows)
+
+    def build(target: int) -> dict[str, Any]:
+        trial = dict(payload)
+        for key in data_keys:
+            value = payload[key]
+            rows = rows_of(value)
+            if rows is None or len(rows) <= target:
+                continue
+            total = original_count(value, rows)
+            capped = cap_rows(rows, target)
+            # cap_rows reports the count of the list it was handed; when that
+            # list is already a downsample, restore the symbol's real total so
+            # a second bound does not make the series look smaller than it is.
+            if isinstance(capped, dict):
+                capped["rows"] = total
+            trial[key] = capped
+        return trial
+
+    # Halving converges in <= log2(250) ~ 8 iterations and is predictable.
+    target = max(counts.values())
+    while target > 1:
+        candidate = build(target)
+        if len(dump(candidate)) <= budget:
+            return candidate
+        target = max(1, target // 2)
+    return build(1)
 
 
 def _json_safe(value: Any) -> Any:
@@ -444,6 +570,13 @@ def fetch_market_data(
                 # table is the fallback for unconverted data (#1541).
                 "adjustment": frame_caliber(df, used_source or src, market, symbol),
             }
+            volume_note = _volume_availability_note(market)
+            if volume_note:
+                # Say out loud that the volume column carries no participation
+                # signal here, so the model stops re-fetching an FX series to
+                # chase a number that spot markets structurally do not publish
+                # (Yahoo returns volume=0 on every USDJPY bar).
+                entry["volume_note"] = volume_note
             quote_currency = frame_attrs.get("quote_currency")
             if isinstance(quote_currency, str) and quote_currency:
                 entry["quote_currency"] = quote_currency
@@ -552,7 +685,7 @@ def fetch_market_data(
     return results
 
 
-def fetch_market_data_json(**kwargs: Any) -> str:
+def fetch_market_data_json(*, budget: int | None = None, **kwargs: Any) -> str:
     """Fetch market data and return strict JSON.
 
     When no requested symbol returned data the envelope says so with
@@ -561,6 +694,13 @@ def fetch_market_data_json(**kwargs: Any) -> str:
     told the model to change the request. ``_unresolved`` and ``_provenance``
     stay, so grounding still records each symbol as unavailable. The dict API
     (``fetch_market_data``) is unchanged for in-process callers.
+
+    Args:
+        budget: Serialized-character ceiling for the envelope. ``None`` uses
+            the shared tool-result limit; ``get_market_data`` passes its own
+            wider ``MARKET_DATA_RESULT_LIMIT`` so a full intraday window is
+            delivered intact instead of downsampled.
+        **kwargs: Forwarded to :func:`fetch_market_data`.
     """
     payload = fetch_market_data(**kwargs)
     unresolved = payload.get("_unresolved") or []
@@ -576,4 +716,10 @@ def fetch_market_data_json(**kwargs: Any) -> str:
             ),
             **payload,
         }
-    return json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
+    # Bound the serialized size here, at the source. The agent loop applies a
+    # hard character cut to every tool result; without this the cut lands mid
+    # JSON on an intraday series and the model receives a truncated prefix it
+    # cannot distinguish from a complete window. Compact separators (not
+    # ``indent=2``) remove ~33% of the bytes before the shrinker even runs.
+    payload = _fit_payload_to_budget(payload, budget)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False)

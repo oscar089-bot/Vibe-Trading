@@ -7,6 +7,29 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Features — 2026-10-16
+
+- **Background market watchers.** A watcher is a deterministic market condition the agent arms on a pair (price level, zone retest, candle close). A separate poll loop evaluates it against live prices with no LLM call in the hot path; the first time the condition becomes true it wakes the owning session to re-analyse and re-arm, and alerts the configured IM channel in the same tick. Authored through the `watcher_manager` tool (auto-discovered, 126 tools), rendered on a deterministic board (Web **Market Watchers** panel on the Scheduled page, `/watchers` in Telegram), and configured by `VIBE_TRADING_ENABLE_WATCHER` plus `VIBE_TRADING_WATCHER_*`.
+- **Watcher creation guard.** `WatcherManagerTool._creation_guard` rejects an incomplete watcher before it is persisted, mirroring OpenAlice's `watchSpecSchema`. Checks: a bare pair (rejects source-prefixed `yfinance|SOLUSD`), a servable timeframe (`1m,5m,15m,30m,1h,4h,1d,1w`), at least one fully-specified deterministic rule (numeric `level`+`side`, or numeric `low`/`high`), and a non-empty plain-English `waiting_trigger`. Every rejection names the offending field and the concrete fix. The authoring contract also rides on `WatcherManagerTool.description` and the `smcpro` `trade-setup.md` WAITING Watcher Rule.
+- **Model-selectable watcher data source.** `WatchItem.source` (default `yfinance`). `src/watcher/market_data.py` gains `DEFAULT_WATCH_SOURCE` + `normalize_source`; the provider passes the source to `fetch_market_data` (`auto` routes by market; an explicit source walks its own fallback chain). An unknown source is rejected at creation. The source is surfaced in the API board item, the board detail line and the WatcherPanel chip.
+- **Telegram `/watchers` board auto-refreshes in place, uncapped.** `_send_watch_board` records the message id and starts a refresh loop that edits the message every `VIBE_TRADING_WATCHER_POLL_SECONDS` (floor 2s) for as long as the board is open — no re-press, and the previous 50-watcher list cap is removed. The loop stops on Close, on a deleted message, on a second `/watchers` press, and on channel stop.
+
+### Fixes — 2026-10-16
+
+- **`.env` silent shadowing (VPS-critical).** `_ensure_dotenv` in `src/providers/llm.py` stopped at the first existing candidate (`~/.vibe-trading/.env` → `agent/.env` → `$CWD/.env`). Because the Web UI writes `~/.vibe-trading/.env` on any settings save, every key that lived only in `agent/.env` was unreachable — a flag such as `VIBE_TRADING_ENABLE_WATCHER=1` looked present on disk yet never reached `os.environ`. The loader now loads every existing candidate; `override=False` keeps first-file-wins precedence for duplicates while previously shadowed keys now load. Startup logs `dotenv resolved from <slot label>` (path redacted). Regression tests in `tests/test_dotenv_observability.py`.
+
+### Maintenance — 2026-10-16
+
+- Symbol resolution and its consumers may share one assistant tool-call batch. A leading resolver runs to completion and locks identity before the batch's consumers are authorized, removing the forced resolve-turn → fetch-turn round trip; a consumer placed before the resolver is still gated against the pre-batch snapshot.
+- Tool results can declare their own delivery ceiling via `BaseTool.result_limit` (resolved by `src.config.limits.resolve_result_limit`). `get_market_data` uses a wider market-data budget so a full intraday OHLCV window is delivered intact instead of downsampled; `read_file` uses a wider read budget so a large skill reference is not cut mid-sentence.
+- `read_file` gains an `offset` (line-skip) parameter and a self-describing truncation envelope (`truncated`, `content_chars_total`, `content_chars_returned`, `next_offset`, `hint`), so a read past the per-read cap states how to resume rather than returning a bare ellipsis.
+- `get_market_data` opts into replay after compaction: a series evicted from context is restored from the run-scoped replay cache instead of re-fetched. The per-tool ceiling is honored in the agent loop, the replay path and the swarm worker.
+- `_provenance.volume_note` marks spot-FX and cash-index results whose `volume` column carries no participation signal (sources commonly report 0). The `get_market_data` description and the `smcpro` skill reference it, so the agent stops re-fetching volume those markets never publish.
+- The `custom` LLM-provider startup check resolves its base URL through the credential vault (`get_llm_credentials`), so a working vault-backed provider is no longer reported as “base URL not set”.
+- Headless hosts (no OS keyring) fall back to a file-backed credential store via `keyrings.alt`, pinned under the runtime secrets directory.
+- Telegram renders one in-place activity line while a turn runs (braille spinner, action/failure counts, tool-name chips as `<code>`), created once, edited in place, and deleted when the answer lands.
+- Bundled `smcpro` SMC/price-action skill added alongside `smc`.
+
 ### Maintenance — 2026-10-13
 
 - extraETF Investments imports now feed portfolio snapshots, with explicit row-count/freshness checks, EUR reference-rate valuation, preserved account/ISIN identity, and non-executing allocation proposals across Web, REST, CLI and the portfolio tool.

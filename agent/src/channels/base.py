@@ -208,6 +208,23 @@ class BaseChannel(ABC):
         this to render editing progress without receiving empty text messages.
         """
 
+    async def send_activity(
+        self, chat_id: str, text: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Render or clear a single in-place "what is it doing" status line.
+
+        ``text`` is the current status (``"Using get_market_data…"``); an empty
+        string with ``_activity_end`` in ``metadata`` clears the line. The
+        default is a no-op so adapters without a live surface ignore it, while
+        ones that can edit a message in place (Telegram) override this to show
+        one status that updates and disappears on completion.
+        """
+
+    @classmethod
+    def overrides_send_activity(cls) -> bool:
+        """True when this adapter implements its own in-place activity line."""
+        return cls.send_activity is not BaseChannel.send_activity
+
     async def send_reasoning(self, msg: OutboundMessage) -> None:
         """Deliver a complete reasoning block.
 

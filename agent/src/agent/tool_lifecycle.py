@@ -22,7 +22,7 @@ from src.agent.tuning import _heartbeat_interval_s, _override, _tool_timeout_sec
 from src.agent.tool_results import (
     _archive_backtest_result, _failure_code, _is_tool_success, _normalize_tool_run_dir,
 )
-from src.config.limits import truncate_tool_result
+from src.config.limits import resolve_result_limit, truncate_tool_result
 from src.tools.redaction import redact_payload, redact_tool_result
 
 logger = logging.getLogger("src.agent.loop")
@@ -86,7 +86,38 @@ class ToolCallLifecycle:
         if self._cancel_event.is_set():
             return compact_requested, focus_topic
 
+        # Resolver-first within a batch: when the model emits the symbol
+        # resolver(s) BEFORE the calls that consume them (its natural habit),
+        # run those resolvers to completion and ingest their result, THEN
+        # authorize the consumers against the freshly-locked identity. This
+        # removes the forced resolve-turn → fetch-turn round trip — the single
+        # largest orchestration cost — without a race: a consumer is still only
+        # dispatched against an identity locked before it ran, and the batch
+        # stays strictly ordered so tool-result messages keep matching the
+        # assistant's tool_calls order.
+        #
+        # Guarded on resolver-first ordering: if any resolver appears after a
+        # non-resolver (or the batch is not a clean prefix), we fall through to
+        # the original all-or-nothing snapshot gate rather than risk reordering
+        # a later consumer ahead of the identity it depends on.
+        resolver_ids = self._run_leading_resolvers(
+            tool_calls, context, messages, trace, react_trace, iteration
+        )
+        if resolver_ids:
+            batch_authorized_symbols = (
+                set(self._grounding.authorized_symbols)
+                if self._grounding is not None
+                else set()
+            )
+            batch_identity_status = (
+                self._grounding.identity_status
+                if self._grounding is not None
+                else "not_required"
+            )
+
         for tc in tool_calls:
+            if tc.id in resolver_ids:
+                continue
             # Layer 4: compact tool — mark then defer execution
             if tc.name == "compact":
                 self._tool_progress.note("compact", "compact")
@@ -183,7 +214,14 @@ class ToolCallLifecycle:
                 restored = _replay_context_result(cached)
                 messages.append(
                     context.format_tool_result(
-                        tc.id, tc.name, truncate_tool_result(restored)
+                        tc.id,
+                        tc.name,
+                        truncate_tool_result(
+                            restored,
+                            resolve_result_limit(
+                                getattr(tool_def, "result_limit", None)
+                            ),
+                        ),
                     )
                 )
                 self._readonly_replay_visibility_pending.add(tc.id)
@@ -332,6 +370,89 @@ class ToolCallLifecycle:
         flush_authorized_segment()
 
         return compact_requested, focus_topic
+
+    def _run_leading_resolvers(
+        self,
+        tool_calls: list,
+        context: ContextBuilder,
+        messages: list,
+        trace: TraceWriter,
+        react_trace: list,
+        iteration: int,
+    ) -> set[str]:
+        """Execute a leading run of symbol resolvers; return their call ids.
+
+        The identity gate authorizes a market-data consumer only against an
+        identity locked *before* the current assistant tool-call batch started.
+        That is correct — a resolver result from the same batch must not silently
+        authorize a call dispatched alongside it — but it also forced every
+        resolution into its own turn: resolve turn, wait, then fetch turn. When
+        the model emits the resolver first (its natural habit), the resolver can
+        run to completion and lock the identity before the consumers in the
+        *same* batch are authorized, removing that round trip without a race.
+
+        Only a strict LEADING prefix is hoisted. A resolver that appears after a
+        consumer is left to the caller's all-or-nothing snapshot gate, so the
+        batch is never reordered and tool-result messages keep matching the
+        assistant's tool_calls order. A resolver whose exact call is blocked by
+        the repeated-failure guard is recorded as blocked here, exactly as the
+        main loop would, so the guard is not bypassed.
+
+        Returns:
+            The call ids executed here; the caller skips them in its own loop.
+        """
+        if self._grounding is None or not tool_calls:
+            return set()
+        from src.agent.grounding.identity import _RESOLVER_TOOL
+
+        resolvers: list[Any] = []
+        for tc in tool_calls:
+            if getattr(tc, "name", None) == _RESOLVER_TOOL:
+                resolvers.append(tc)
+                continue
+            break
+        if not resolvers:
+            return set()
+
+        executed: set[str] = set()
+        for tc in resolvers:
+            if self._cancel_event.is_set():
+                break
+            dedup_key = self._identical_call_key(tc.name, tc.arguments)
+            if dedup_key is not None and self._tool_progress.is_blocked(dedup_key):
+                failed_result = json.dumps(
+                    {
+                        "status": "error",
+                        "skipped": True,
+                        "reason": "This exact call already failed repeatedly in this run. Change strategy or ask the user for help.",
+                    }
+                )
+                self._record_blocked_tool_call(
+                    tc,
+                    failed_result,
+                    context,
+                    messages,
+                    trace,
+                    react_trace,
+                    iteration,
+                )
+                executed.add(tc.id)
+                continue
+            # Run the resolver through the gate so its state machine transition
+            # (_identity_required/_buffer_output + _begin_resolution) is exactly
+            # the one the main loop would perform. The resolver path always
+            # returns allowed=True; its result cannot authorize a peer, but it
+            # DOES lock the identity for the consumers that follow it here.
+            self._grounding.authorize_tool_call(
+                tc.name,
+                tc.arguments,
+                batch_authorized_symbols=self._grounding.authorized_symbols,
+                call_id=tc.id,
+                batch_identity_status=self._grounding.identity_status,
+            )
+            self._execute_single(tc, context, messages, trace, react_trace, iteration)
+            executed.add(tc.id)
+        return executed
 
     def _record_blocked_tool_call(
         self,
@@ -895,7 +1016,17 @@ class ToolCallLifecycle:
                 self._readonly_replay_protected.clear()
 
         status = "ok" if success else "error"
-        truncated = truncate_tool_result(result)
+        # A tool whose natural payload is legitimately larger than the shared
+        # default (market data) declares its own ceiling; everything else uses
+        # TOOL_RESULT_LIMIT. Resolved here so the cut matches what the tool
+        # already bounded its payload to at the source.
+        try:
+            limit = resolve_result_limit(
+                getattr(self.registry.get(tc.name), "result_limit", None)
+            )
+        except Exception:  # noqa: BLE001 - unknown tool falls back to the default
+            limit = resolve_result_limit(None)
+        truncated = truncate_tool_result(result, limit)
         messages.append(context.format_tool_result(tc.id, tc.name, truncated))
 
         # One redaction feeds every subscriber below: the persisted trace

@@ -9,6 +9,7 @@ from datetime import date
 from typing import Any
 
 from src.agent.tools import BaseTool
+from src.config.limits import MARKET_DATA_RESULT_LIMIT
 from src.market_data import DEFAULT_MAX_ROWS, fetch_market_data_json
 from backtest.engines._market_hooks import _detect_market
 from backtest.loaders.registry import VALID_SOURCES
@@ -86,7 +87,11 @@ class MarketDataTool(BaseTool):
         "yfinance/OKX/Tushare scripts. Volume units are source- and market-dependent "
         "(A-share sources report board lots of 100 shares, HK/US sources report single "
         "shares); read the per-symbol _provenance.volume_unit field ('lots' / 'shares' / "
-        "null=undeclared) before interpreting or comparing volume values. Price caliber "
+        "null=undeclared) before interpreting or comparing volume values. When a market "
+        "structurally has no volume (spot FX, cash indices), _provenance.volume_note says "
+        "so and the volume column is not a participation signal — do not re-fetch to "
+        "chase it. "
+        "Price caliber "
         "is source-dependent too (some sources adjust for splits/dividends, others serve "
         "raw quotes); read _provenance.adjustment ('raw' / 'split' / 'split_dividend' / "
         "'split_dividend_additive' / 'na' / 'unknown') before comparing price levels "
@@ -153,6 +158,16 @@ class MarketDataTool(BaseTool):
         "required": ["codes", "start_date", "end_date"],
     }
     repeatable = True
+    # A full intraday OHLCV window is legitimately larger than the shared 10k
+    # default; deliver the whole requested window (up to max_rows) rather than
+    # a lossy downsample the model cannot tell from a complete series.
+    result_limit = MARKET_DATA_RESULT_LIMIT
+    # An exact successful fetch restored from the run-scoped replay cache after
+    # compaction is the SAME series the model already paid for. Replaying it
+    # beats re-fetching: the agent's reported failure was a successful payload
+    # evicted from context, then the identical call re-issued. Opting in makes
+    # compaction restore it and refuse the redundant re-fetch.
+    replay_after_compaction = True
 
     def execute(self, **kwargs: Any) -> str:
         """Validate inputs, then fetch and return strict JSON.
@@ -242,4 +257,6 @@ class MarketDataTool(BaseTool):
         loader_resolver = kwargs.get("loader_resolver")
         if loader_resolver is not None:
             fetch_kwargs["loader_resolver"] = loader_resolver
-        return fetch_market_data_json(**fetch_kwargs)
+        # Pass this tool's own delivery ceiling so a full intraday window fits
+        # intact; the shared default would downsample it first.
+        return fetch_market_data_json(budget=self.result_limit, **fetch_kwargs)

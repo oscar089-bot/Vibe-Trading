@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.agent.tools import BaseTool
+from src.config.limits import READ_FILE_RESULT_LIMIT
 from src.tools.path_utils import safe_path as _safe_path
 from src.tools.path_utils import safe_run_dir as _safe_run_dir
 from src.tools.path_utils import allowed_file_roots
@@ -96,10 +97,23 @@ class ReadFileTool(BaseTool):
                 ),
             },
             "limit": {"type": "integer", "description": "Max number of lines to return (default: all)"},
+            "offset": {
+                "type": "integer",
+                "description": (
+                    "Number of leading lines to skip (default: 0). Use with the "
+                    "`offset` returned by a truncated read to continue the file."
+                ),
+            },
         },
         "required": ["path"],
     }
     repeatable = True
+    # A skill reference document is trusted guidance the model explicitly asked
+    # for; delivering it whole is the point. The shared 10k tool-result cap cut
+    # a 13.4k reference mid-sentence (analysis.md, Step 5's ACTIVE threshold),
+    # so this tool declares a ceiling that clears its own ``_OUTPUT_LIMIT`` plus
+    # the JSON envelope. Files past ``_OUTPUT_LIMIT`` are paged via ``offset``.
+    result_limit = READ_FILE_RESULT_LIMIT
 
     def execute(self, **kwargs: Any) -> str:
         """Read a file.
@@ -229,19 +243,41 @@ class ReadFileTool(BaseTool):
 
         try:
             text = resolved.read_text(encoding="utf-8")
+            total_chars = len(text)
+            # Line-offset paging so a caller can walk a file larger than one
+            # result. Line-based (matching ``limit``), so a resumed read never
+            # splits a line in half — the failure that made a truncated read
+            # look like a corrupt file.
+            offset = kwargs.get("offset")
+            if isinstance(offset, int) and offset > 0:
+                lines = text.splitlines(keepends=True)
+                text = "".join(lines[offset:])
             if limit and limit > 0:
                 lines = text.splitlines(keepends=True)
                 text = "".join(lines[:limit])
-            if len(text) > _OUTPUT_LIMIT:
-                text = text[:_OUTPUT_LIMIT] + "\n... (truncated)"
-            return json.dumps(
-                {
-                    "status": "ok",
-                    "path": str(resolved),
-                    "content": text,
-                },
-                ensure_ascii=False,
-            )
+            truncated = len(text) > _OUTPUT_LIMIT
+            if truncated:
+                text = text[:_OUTPUT_LIMIT]
+            payload: dict[str, Any] = {
+                "status": "ok",
+                "path": str(resolved),
+                "content": text,
+            }
+            if truncated:
+                # Self-describing, mirroring ``truncate_tool_result``: state how
+                # much was withheld and how to resume, instead of an ambiguous
+                # "... (truncated)" the model cannot act on. The line count
+                # returned lets the caller pick the exact next ``offset``.
+                lines_returned = text.count("\n")
+                payload["truncated"] = True
+                payload["content_chars_total"] = total_chars
+                payload["content_chars_returned"] = len(text)
+                payload["next_offset"] = (offset or 0) + lines_returned
+                payload["hint"] = (
+                    "Content exceeded the per-read cap. Re-read with "
+                    "offset=<next_offset> to continue from the next line."
+                )
+            return json.dumps(payload, ensure_ascii=False)
         except Exception as exc:
             return json.dumps(
                 {

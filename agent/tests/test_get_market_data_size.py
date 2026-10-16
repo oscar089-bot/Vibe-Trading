@@ -49,15 +49,60 @@ def test_oversized_symbol_is_capped_with_metadata(monkeypatch):
     assert not any(isinstance(row, dict) and "_gap" in row for row in out["data"])
 
 
+def test_intraday_style_payload_is_delivered_complete(monkeypatch):
+    """A 250-row intraday window must come back WHOLE, not downsampled.
+
+    Regression: 250 intraday rows (~23.5k compact chars) exceeded the shared
+    10k tool-result budget, so the payload was downsampled (or, before the
+    size fix, cut mid-JSON) and the model computed structure on a partial
+    window it could not tell from a complete one. get_market_data now declares
+    its own wider ceiling so the full requested window is delivered intact.
+    """
+    from src.config.limits import MARKET_DATA_RESULT_LIMIT
+
+    monkeypatch.setattr(mcp_server, "_get_loader", lambda src: _loader_with_rows(250))
+    raw = _gmd(codes=["X.US"], start_date="2025-01-01", end_date="2026-01-01", source="yfinance")
+
+    assert len(raw) <= MARKET_DATA_RESULT_LIMIT, "payload must fit the tool's own budget"
+    out = json.loads(raw)["X.US"]
+    assert isinstance(out, list), "an intraday window within budget is not downsized"
+    assert len(out) == 250, "every requested intraday row must be delivered"
+
+
 def test_small_query_unchanged_plain_list(monkeypatch):
     """No-regression: under the cap the shape is the original plain list."""
     out = _call(monkeypatch, 50)["X.US"]
     assert isinstance(out, list) and len(out) == 50
 
 
-def test_max_rows_zero_disables_cap(monkeypatch):
+def test_max_rows_zero_disables_the_row_count_cap(monkeypatch):
+    """``max_rows=0`` removes the ROW-COUNT cap when the payload fits budget.
+
+    300 compact daily rows fit inside the market-data ceiling, so all 300 come
+    back as a plain list — proof the row-count cap itself did not run. The
+    character budget is a separate bound (see the oversized test below).
+    """
     out = _call(monkeypatch, 300, max_rows=0)["X.US"]
     assert isinstance(out, list) and len(out) == 300
+
+
+def test_oversized_series_still_bounded_by_the_character_budget(monkeypatch):
+    """Past the tool's own ceiling the payload is still bounded, never cut.
+
+    3000 compact rows (~270k chars) exceed even the widened market-data
+    budget, so the series is downsized with truncation metadata rather than
+    cut mid-JSON downstream.
+    """
+    from src.config.limits import MARKET_DATA_RESULT_LIMIT
+
+    monkeypatch.setattr(mcp_server, "_get_loader", lambda src: _loader_with_rows(3000))
+    raw = _gmd(codes=["X.US"], start_date="2025-01-01", end_date="2026-01-01", source="yfinance")
+
+    assert len(raw) <= MARKET_DATA_RESULT_LIMIT
+    out = json.loads(raw)["X.US"]
+    assert isinstance(out, dict) and out["truncated"] is True
+    assert out["rows"] == 3000
+    assert "every-" in out["policy"]
 
 
 def test_default_caps_canonical_one_year_daily(monkeypatch):
@@ -67,9 +112,13 @@ def test_default_caps_canonical_one_year_daily(monkeypatch):
 
 
 def test_boundary_n_equals_max_rows_is_plain_list(monkeypatch):
-    """G3 (i): exactly at the cap returns the plain list, not truncated."""
-    out = _call(monkeypatch, 250, max_rows=250)["X.US"]
-    assert isinstance(out, list) and len(out) == 250
+    """G3 (i): exactly at the cap returns the plain list, not truncated.
+
+    Sized to fit the character budget so this isolates the ROW-COUNT contract;
+    the budget is a separate bound with its own test above.
+    """
+    out = _call(monkeypatch, 100, max_rows=100)["X.US"]
+    assert isinstance(out, list) and len(out) == 100
 
 
 def test_negative_max_rows_still_caps(monkeypatch):

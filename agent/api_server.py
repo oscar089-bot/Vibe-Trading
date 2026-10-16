@@ -123,6 +123,11 @@ from src.api.scheduled_routes import (  # noqa: F401, E402
     _stop_scheduled_research_executor,
     _stop_scheduled_research_on_shutdown,
 )
+from src.api.watcher_routes import (  # noqa: F401, E402
+    _get_watcher_service,
+    _start_watcher_service,
+    _stop_watcher_service,
+)
 
 
 async def _run_startup_preflight() -> None:
@@ -137,6 +142,7 @@ async def _run_startup_preflight() -> None:
         logging.getLogger(__name__).warning("Legacy state migration failed", exc_info=True)
     run_preflight(console)
     _start_scheduled_research_executor()
+    _start_watcher_service()
     from src.config.accessor import get_env_config
 
     if get_env_config().agent_tuning.vibe_trading_channels_auto_start:
@@ -150,6 +156,7 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
         await _run_startup_preflight()
         yield
     finally:
+        await _stop_watcher_service()
         await _stop_scheduled_research_on_shutdown()
 
 
@@ -314,6 +321,10 @@ try_register_openbb_routes(app)
 # --- Scheduled research ---
 from src.api.scheduled_routes import register_scheduled_routes  # noqa: E402
 register_scheduled_routes(app)
+
+# --- Watchers ---
+from src.api.watcher_routes import register_watcher_routes  # noqa: E402
+register_watcher_routes(app)
 
 from src.api.scheduled_routes import (  # noqa: E402, F401
     CreateRunFromPlaybookRequest,

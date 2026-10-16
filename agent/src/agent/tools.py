@@ -30,6 +30,14 @@ class BaseTool(ABC):
     parameters: Dict[str, Any] = {}
     repeatable: bool = False
     is_readonly: bool = True
+    # Per-tool delivery cap in characters. ``None`` uses the shared
+    # ``TOOL_RESULT_LIMIT``. A tool whose natural payload is legitimately
+    # larger than the default — a full intraday OHLCV window — can raise this
+    # so the agent receives the complete series instead of a lossy downsample.
+    # The number bounds ONE result's transport size; overall context growth is
+    # still governed by the compaction layers, so this is a widening of the
+    # cut point, not a removal of the budget.
+    result_limit: Optional[int] = None
     # Pure, side-effect-free computation: identical args always produce the
     # same result, so the loop may serve repeated identical calls from cache
     # instead of re-executing them (financial_rigor calc/verify, etc.).

@@ -69,6 +69,45 @@ def test_longbridge_sdk_is_optional_and_available_as_an_extra() -> None:
     assert "longbridge" in longbridge_extra
 
 
+def test_smc_engine_rides_the_docker_lock() -> None:
+    """The SMC structural engine must reach the Docker image, not just the extra.
+
+    ``smartmoneyconcepts`` is declared in the ``[smc]`` extra, but the runtime
+    image installs from the hash-pinned lock generated from
+    ``agent/requirements.txt`` — an extra is never resolved there. The bundled
+    ``smc`` / ``smcpro`` skills run ``scripts/smc.py``, which imports it, so a
+    lock without it means the skill fails on a fresh deploy even though the
+    package metadata says the dependency exists. Same failure mode as
+    ``keyrings.alt`` before it.
+    """
+    import re
+
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    requirements_txt = {
+        _normalized_requirement_name(line)
+        for line in (ROOT / "agent" / "requirements.txt").read_text().splitlines()
+        if line and not line.startswith("#")
+    }
+    lock_text = (ROOT / "requirements-lock.txt").read_text()
+    smc_extra = {
+        _normalized_requirement_name(requirement)
+        for requirement in pyproject["project"]["optional-dependencies"]["smc"]
+    }
+
+    assert "smartmoneyconcepts" in smc_extra
+    assert "smartmoneyconcepts" in requirements_txt, (
+        "agent/requirements.txt must list smartmoneyconcepts or the Docker lock "
+        "omits it and the bundled SMC skills fail on a fresh deploy"
+    )
+    assert re.search(r"^smartmoneyconcepts==", lock_text, re.M), (
+        "requirements-lock.txt must pin smartmoneyconcepts with hashes"
+    )
+    # numba/llvmlite are its heavy transitive deps; both must be pinned too or
+    # the hash-locked install fails on the missing requirement.
+    assert re.search(r"^numba==", lock_text, re.M), "numba must be pinned in the lock"
+    assert re.search(r"^llvmlite==", lock_text, re.M), "llvmlite must be pinned in the lock"
+
+
 def test_channel_core_websocket_dependency_is_declared_for_baseline_installs() -> None:
     """The built-in WebSocket gateway imports websockets at module import time."""
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())

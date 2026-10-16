@@ -14,6 +14,12 @@ httpx>=0.28.0
 h2>=4.4.1
 oauth-cli-kit>=0.1.3
 
+# Secrets -- headless file fallback for the OS credential vault. ``keyring``
+# itself arrives transitively (py-key-value-aio) and stays optional; this adds
+# the non-interactive file backend CredentialStore falls back to when no OS
+# vault is reachable (servers, containers), pinned so the Docker lock carries it.
+keyrings.alt>=5.0.0
+
 # Data & Computation
 pandas>=2.0.0,<3.0.0
 numpy>=1.24.0
@@ -35,7 +41,12 @@ joblib>=1.3.0
 
 # Signal Skills
 # optional: pip install "vibe-trading-ai[harmonic]" for the pyharmonics-backed harmonic pattern detector
-# optional: pip install "vibe-trading-ai[smc]" for the smartmoneyconcepts-backed Smart Money Concepts engine
+# Smart Money Concepts (ICT) structural engine. Declared here so the Docker
+# lock carries it: the bundled smc/smcpro skills run scripts/smc.py, which
+# imports smartmoneyconcepts. It drags in numba -> llvmlite; those ship Linux
+# wheels, so the image builds cleanly, and its absence on Intel macOS is the
+# reason it stays an extra rather than a base dependency (#1035).
+smartmoneyconcepts>=0.0.27
 
 # Data Providers
 tushare>=1.2.89

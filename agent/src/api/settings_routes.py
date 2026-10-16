@@ -714,7 +714,15 @@ def register_settings_routes(
         if provider_name == "custom":
             from src.providers.custom_profiles import active_provider_credentials
 
-            active = active_provider_credentials()
+            try:
+                active = active_provider_credentials()
+            except (ValueError, RuntimeError) as exc:
+                # A missing/empty active custom profile is a configuration state
+                # the operator fixes in the provider manager, not a server fault.
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"No usable custom provider is active: {exc}",
+                ) from exc
             if (payload.model_name.strip() != active["model"]
                     or payload.base_url not in (None, active["base_url"])
                     or payload.api_key or payload.clear_api_key):

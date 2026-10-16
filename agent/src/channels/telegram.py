@@ -420,6 +420,52 @@ class TelegramConfig(BaseModel):
         return self
 
 
+def _load_watcher_state() -> tuple[list[Any], bool, float]:
+    """Load watcher records plus the poller's running state and cadence.
+
+    Reads the persisted store and the same env-configured cadence the service
+    uses, so the board's liveness line is honest about what the loop is doing.
+    Never raises: a store or config failure degrades to an empty board.
+    """
+    running = False
+    poll_seconds = 30.0
+    try:
+        from src.config.accessor import get_env_config
+
+        tuning = get_env_config().agent_tuning
+        poll_seconds = float(getattr(tuning, "vibe_trading_watcher_poll_seconds", 30.0) or 30.0)
+        from src.api.watcher_routes import _get_watcher_service
+
+        running = _get_watcher_service().is_running
+    except Exception:
+        pass
+    try:
+        from src.watcher.store import WatcherStore, default_watchers_dir
+
+        # No cap: the operator asked for the whole board, not a page of 50.
+        # The store slices ``items[:limit]``, so a large limit means "all".
+        items = WatcherStore(default_watchers_dir()).list(include_terminal=False, limit=1_000_000)
+    except Exception:
+        items = []
+    return items, running, poll_seconds
+
+
+def _build_board_items(
+    items: list[Any], *, running: bool, poll_seconds: float
+) -> list[dict[str, Any]]:
+    """Render every watcher to a board card via the pure board module."""
+    from src.watcher.board import render_watcher_board_card, watcher_item_to_board
+
+    cards: list[dict[str, Any]] = []
+    for item in items:
+        try:
+            inputs = watcher_item_to_board(item, running=running, poll_seconds=poll_seconds)
+            cards.append(render_watcher_board_card(**inputs))
+        except Exception:
+            continue
+    return cards
+
+
 class TelegramChannel(BaseChannel):
     """
     Telegram channel using long polling or webhook mode.
@@ -463,6 +509,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("dream", "Run Dream memory consolidation now"),
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
+        BotCommand("watchers", "Show the market watcher board"),
         BotCommand("help", "Show available commands"),
     ]
 
@@ -493,6 +540,17 @@ class TelegramChannel(BaseChannel):
         self._inbound_buffers: dict[str, list[_QueuedTelegramUpdate]] = {}
         self._inbound_workers: dict[str, asyncio.Task] = {}
         self._rich_send_disabled: bool = False  # Latch off if Bot API < 10.1
+        # chat_id -> message_id of the single live activity line. One message
+        # is created on the first status and EDITED in place for every later
+        # one, then DELETED when the turn ends, so no "Working…" line survives
+        # above the answer.
+        self._activity_msgs: dict[str, int] = {}
+        self._activity_last: dict[str, str] = {}
+        # chat_id -> {index, expanded, watcher_id, message_id, refresh_task} for
+        # the /watchers pager. Bounded by the number of chats that opened the
+        # board; each entry is small, and Close removes it (and cancels its
+        # auto-refresh task).
+        self._watch_board_state: dict[str, dict] = {}
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -573,6 +631,12 @@ class TelegramChannel(BaseChannel):
             )
         )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
+        self._app.add_handler(
+            MessageHandler(
+                filters.Regex(r"^/(watchers|watcher)(?:@\w+)?$"),
+                self._on_watchers,
+            )
+        )
 
         # Add message handler for text, photos, video, voice, documents, and locations
         self._app.add_handler(
@@ -659,6 +723,11 @@ class TelegramChannel(BaseChannel):
 
         if self._app:
             self.logger.info("Stopping bot...")
+            # Stop every board auto-refresh loop before tearing down the app,
+            # so no task edits a message through a closed bot.
+            for chat_key in list(self._watch_board_state.keys()):
+                self._cancel_watch_refresh(chat_key)
+            self._watch_board_state.clear()
             await self._app.updater.stop()
             await self._app.stop()
             await self._app.shutdown()
@@ -934,6 +1003,100 @@ class TelegramChannel(BaseChannel):
     def _is_not_modified_error(exc: Exception) -> bool:
         return isinstance(exc, BadRequest) and "message is not modified" in str(exc).lower()
 
+    async def send_activity(
+        self, chat_id: str, text: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Render one editable "what is it doing" line, then clear it.
+
+        A single Telegram message is created on the first status, edited in
+        place for each later one, and deleted once ``_activity_end`` arrives
+        (or the final answer is sent). Telegram is rate-limited per chat, so
+        this edits rather than posts — the reader sees one line that changes,
+        never a stack of "Working…" messages.
+        """
+        if not self._app:
+            return
+        meta = metadata or {}
+        try:
+            int_chat_id = int(chat_id)
+        except (TypeError, ValueError):
+            return
+        thread_kwargs = {}
+        if message_thread_id := meta.get("message_thread_id"):
+            thread_kwargs["message_thread_id"] = message_thread_id
+
+        if meta.get("_activity_end"):
+            await self._clear_activity(int_chat_id, chat_id)
+            return
+
+        # Prefer the rich HTML card (bold header + blockquote tool meta) when
+        # the producer supplied one; fall back to the plain line otherwise.
+        plain = (text or "").strip()
+        rich = str(meta.get("_activity_rich") or "").strip()
+        body = rich or plain
+        if not body:
+            return
+        # Dedupe on the plain text so an identical frame is not re-sent, and
+        # an edit only fires when the rendered content actually changed.
+        dedupe_key = plain or body
+        if self._activity_last.get(chat_id) == dedupe_key:
+            return
+        self._activity_last[chat_id] = dedupe_key
+        existing = self._activity_msgs.get(chat_id)
+        try:
+            if existing is None:
+                sent = await self._call_with_retry(
+                    self._app.bot.send_message,
+                    chat_id=int_chat_id, text=body, parse_mode="HTML",
+                    **thread_kwargs,
+                )
+                self._activity_msgs[chat_id] = sent.message_id
+            else:
+                await self._call_with_retry(
+                    self._app.bot.edit_message_text,
+                    chat_id=int_chat_id, message_id=existing, text=body,
+                    parse_mode="HTML",
+                )
+        except BadRequest as exc:
+            if self._is_not_modified_error(exc):
+                return
+            # HTML can be rejected (markup edge case); retry once as plain text
+            # so the reader still sees a live line rather than nothing.
+            self.logger.debug("activity HTML rejected, retrying plain: %s", exc)
+            try:
+                if existing is None:
+                    sent = await self._call_with_retry(
+                        self._app.bot.send_message,
+                        chat_id=int_chat_id, text=plain or body, **thread_kwargs,
+                    )
+                    self._activity_msgs[chat_id] = sent.message_id
+                else:
+                    await self._call_with_retry(
+                        self._app.bot.edit_message_text,
+                        chat_id=int_chat_id, message_id=existing, text=plain or body,
+                    )
+            except Exception as inner:  # noqa: BLE001 - a status line must never fail a turn
+                if not self._is_not_modified_error(inner):
+                    self.logger.debug("activity plain fallback failed: %s", inner)
+        except Exception as exc:  # noqa: BLE001 - a status line must never fail a turn
+            if self._is_not_modified_error(exc):
+                return
+            self.logger.debug("activity line update failed: %s", exc)
+
+    async def _clear_activity(self, int_chat_id: int, chat_id: str) -> None:
+        """Delete the live activity line, if one is showing."""
+        self._activity_last.pop(chat_id, None)
+        message_id = self._activity_msgs.pop(chat_id, None)
+        if message_id is None or self._app is None:
+            return
+        try:
+            await self._call_with_retry(
+                self._app.bot.delete_message,
+                chat_id=int_chat_id, message_id=message_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+            self.logger.debug("activity line delete failed: %s", exc)
+
     async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
         """Progressive message editing: send on first delta, edit on subsequent ones."""
         if not self._app:
@@ -1139,6 +1302,238 @@ class TelegramChannel(BaseChannel):
             await self._send_pairing_code_if_private(sender_id, update.message, user)
             return
         await update.message.reply_text("Use /help for available commands. Docs: https://github.com/HKUDS/Vibe-Trading")
+
+    async def _on_watchers(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /watchers - open the market-watcher board.
+
+        Deterministic: reads the persisted watcher records and formats them
+        with no model call, so the operator gets the same board for the same
+        state and no tokens are spent. The board is a single message that the
+        inline buttons edit in place: Previous/Next page through the watchers,
+        Details/Collapse toggles the full panel, Delete cancels the shown one.
+        """
+        if not update.message or not update.effective_user:
+            return
+        user = update.effective_user
+        sender_id = self._sender_id(user)
+        if not self.is_allowed(sender_id):
+            await self._send_pairing_code_if_private(sender_id, update.message, user)
+            return
+        chat_key = str(update.message.chat_id)
+        # A fresh /watchers press starts at the first watcher, collapsed and
+        # auto-refreshing. Cancel any prior refresh loop for this chat first so
+        # a second /watchers press cannot leave two loops editing one message.
+        self._cancel_watch_refresh(chat_key)
+        self._watch_board_state[chat_key] = {"index": 0, "expanded": set()}
+        await self._send_watch_board(chat_key, reply_to=update.message.message_id)
+
+    async def _send_watch_board(self, chat_key: str, *, reply_to: int | None = None, edit_message=None) -> None:
+        """Render the board for ``chat_key`` and send (or edit) the message.
+
+        A fresh send records the message id and starts the auto-refresh loop,
+        so the board keeps itself current without another /watchers press. A
+        button-driven edit reuses the same message and (re)arms the loop.
+        """
+        html, keyboard = self._render_watch_board(chat_key)
+        try:
+            if edit_message is not None:
+                await edit_message.edit_text(
+                    text=html, parse_mode="HTML", reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+                state = self._watch_board_state.get(chat_key)
+                if state is not None and getattr(edit_message, "message_id", None):
+                    state["message_id"] = edit_message.message_id
+                self._start_watch_refresh(chat_key)
+                return
+            kwargs: dict[str, Any] = {
+                "chat_id": int(chat_key),
+                "text": html,
+                "parse_mode": "HTML",
+                "reply_markup": keyboard,
+                "disable_web_page_preview": True,
+            }
+            if reply_to is not None:
+                kwargs["reply_parameters"] = ReplyParameters(
+                    message_id=reply_to, allow_sending_without_reply=True
+                )
+            sent = await self._app.bot.send_message(**kwargs)
+            state = self._watch_board_state.get(chat_key)
+            if state is not None and sent is not None:
+                state["message_id"] = getattr(sent, "message_id", None)
+            self._start_watch_refresh(chat_key)
+        except BadRequest as exc:
+            self.logger.warning("watch board send failed: %s", exc)
+        except Exception:
+            self.logger.exception("watch board send failed")
+
+    def _watch_refresh_seconds(self) -> float:
+        """Return the board's auto-refresh interval, tied to the poll cadence.
+
+        Editing slower than the poller would show stale prices, so this mirrors
+        ``VIBE_TRADING_WATCHER_POLL_SECONDS``. Floored at 2s so a tiny poll
+        value cannot turn the board into an edit flood Telegram rate-limits.
+        """
+        try:
+            from src.config.accessor import get_env_config
+
+            tuning = get_env_config().agent_tuning
+            poll = float(getattr(tuning, "vibe_trading_watcher_poll_seconds", 30.0) or 30.0)
+            return max(2.0, poll)
+        except Exception:
+            return 30.0
+
+    def _start_watch_refresh(self, chat_key: str) -> None:
+        """Start the board's auto-refresh loop for ``chat_key`` if not running."""
+        state = self._watch_board_state.get(chat_key)
+        if not state or not state.get("message_id"):
+            return
+        existing = state.get("refresh_task")
+        if existing is not None and not existing.done():
+            return
+        state["refresh_task"] = asyncio.create_task(self._watch_refresh_loop(chat_key))
+
+    def _cancel_watch_refresh(self, chat_key: str) -> None:
+        """Cancel the board's auto-refresh loop for ``chat_key`` if running."""
+        state = self._watch_board_state.get(chat_key)
+        if not state:
+            return
+        task = state.get("refresh_task")
+        if task is not None and not task.done():
+            task.cancel()
+        state["refresh_task"] = None
+
+    async def _watch_refresh_loop(self, chat_key: str) -> None:
+        """Edit the board message in place forever, so it is always current.
+
+        Loops until the board is closed, its message is deleted, or an edit
+        fails for a reason other than "message is not modified". A deleted
+        message cannot be revived, so the loop ends rather than retrying
+        forever. No caps: the board keeps updating for as long as it is open.
+        """
+        try:
+            while True:
+                if not self._watch_board_state.get(chat_key):
+                    return
+                await asyncio.sleep(self._watch_refresh_seconds())
+                state = self._watch_board_state.get(chat_key)
+                if not state:
+                    return
+                message_id = state.get("message_id")
+                if not message_id:
+                    return
+                try:
+                    html, keyboard = self._render_watch_board(chat_key)
+                    await self._app.bot.edit_message_text(
+                        chat_id=int(chat_key),
+                        message_id=int(message_id),
+                        text=html,
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                        disable_web_page_preview=True,
+                    )
+                except BadRequest as exc:
+                    if "not modified" in str(exc).lower():
+                        continue
+                    self.logger.warning("watch board refresh stopped: %s", exc)
+                    return
+                except Exception:
+                    self.logger.exception("watch board refresh failed")
+                    return
+        except asyncio.CancelledError:
+            return
+
+    def _render_watch_board(self, chat_key: str) -> tuple[str, Any]:
+        """Build the board html + inline keyboard for one chat."""
+        from src.watcher.board import format_telegram_watcher_board
+        from src.watcher.models import utc_now_iso
+
+        state = self._watch_board_state.setdefault(chat_key, {"index": 0, "expanded": set()})
+        items, running, poll_seconds = _load_watcher_state()
+        cards = _build_board_items(items, running=running, poll_seconds=poll_seconds)
+        frame = int(time.time()) % 12
+        board = format_telegram_watcher_board(
+            items=cards,
+            index=int(state.get("index", 0)),
+            expanded=set(state.get("expanded", set())),
+            frame=frame,
+            now_iso=utc_now_iso(),
+            refresh_seconds=int(max(1.0, poll_seconds)),
+            running=running,
+            poll_seconds=poll_seconds,
+        )
+        state["index"] = board["index"]
+        state["watcher_id"] = cards[board["index"]]["watcher_id"] if cards else ""
+        keyboard = self._build_watch_keyboard(board["actions"])
+        return board["html"], keyboard
+
+    @staticmethod
+    def _build_watch_keyboard(actions: list) -> Any:
+        """Build an inline keyboard from ``[{text, data}]`` rows.
+
+        Unlike the generic ``_build_keyboard`` the callback data here is an
+        explicit ``wb:`` control token, not the button label. Returns None when
+        the config disables inline keyboards, so the board renders as text with
+        no unreachable buttons (``_on_callback_query`` is not even registered
+        in that mode).
+        """
+        rows = [
+            [InlineKeyboardButton(btn["text"], callback_data=btn["data"]) for btn in row if btn.get("text")]
+            for row in actions
+            if row
+        ]
+        return InlineKeyboardMarkup(rows) if rows else None
+
+    async def _on_watch_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Handle a ``wb:`` board button press. Returns False when not ours."""
+        from src.watcher.board import parse_telegram_watch_control
+
+        query = update.callback_query
+        if query is None:
+            return False
+        control = parse_telegram_watch_control(query.data or "")
+        if control is None:
+            return False
+        user = update.effective_user
+        chat_id = query.message.chat_id if query.message else None
+        if not chat_id or not user:
+            await query.answer()
+            return True
+        await query.answer()
+        if not self.is_allowed(self._sender_id(user)):
+            return True
+        chat_key = str(chat_id)
+        state = self._watch_board_state.setdefault(chat_key, {"index": 0, "expanded": set()})
+        if control == "close":
+            self._cancel_watch_refresh(chat_key)
+            self._watch_board_state.pop(chat_key, None)
+            with suppress(Exception):
+                await query.message.delete()
+            return True
+        if control == "next":
+            state["index"] = int(state.get("index", 0)) + 1
+        elif control == "prev":
+            state["index"] = max(0, int(state.get("index", 0)) - 1)
+        elif control == "toggle":
+            watcher_id = str(state.get("watcher_id") or "")
+            expanded = set(state.get("expanded", set()))
+            if watcher_id in expanded:
+                expanded.discard(watcher_id)
+            elif watcher_id:
+                expanded.add(watcher_id)
+            state["expanded"] = expanded
+        elif control == "delete":
+            watcher_id = str(state.get("watcher_id") or "")
+            if watcher_id:
+                try:
+                    from src.watcher.store import WatcherStore, default_watchers_dir
+
+                    WatcherStore(default_watchers_dir()).delete(watcher_id)
+                except Exception:
+                    self.logger.exception("failed to delete watcher %s", watcher_id)
+                state["index"] = 0
+        await self._send_watch_board(chat_key, edit_message=query.message)
+        return True
 
     @staticmethod
     def _sender_id(user) -> str:
@@ -1689,6 +2084,10 @@ class TelegramChannel(BaseChannel):
     async def _on_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle inline keyboard button clicks (callback queries)."""
         if not update.callback_query or not update.effective_user:
+            return
+        # The watcher board owns its own ``wb:`` callback namespace and edits
+        # its message in place; fall through to the generic handler otherwise.
+        if await self._on_watch_callback(update, context):
             return
         query = update.callback_query
         user = update.effective_user

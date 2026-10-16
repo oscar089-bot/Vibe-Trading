@@ -7,6 +7,7 @@ LLM provider failure is critical (blocks startup).
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from importlib.util import find_spec
@@ -16,6 +17,8 @@ from rich.console import Console
 from rich.table import Table
 
 from src.config.accessor import get_env_config, reset_env_config
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,7 @@ class CheckResult:
 
 def _check_llm_provider() -> CheckResult:
     """Verify LLM provider connectivity."""
+    from src.providers.capabilities import get_llm_credentials
     from src.providers.llm import _ensure_dotenv, _sync_provider_env, provider_diagnostics
 
     _ensure_dotenv()
@@ -61,8 +65,25 @@ def _check_llm_provider() -> CheckResult:
         )
 
     _sync_provider_env()
-    diagnostics = provider_diagnostics()
-    base_url = os.getenv("OPENAI_BASE_URL", "") or os.getenv("OPENAI_API_BASE", "")  # noqa: env-gate — diagnostic base URL fallback
+    try:
+        diagnostics = provider_diagnostics()
+    except Exception as exc:
+        # A misconfigured provider (e.g. a custom profile marked active with no
+        # stored key) must be *reported*, not raised: this runs during startup
+        # and the operator fixes it from the Web UI, which needs the server up.
+        return CheckResult(
+            name=f"LLM ({provider})",
+            status="error",
+            message=f"{type(exc).__name__}: {exc}",
+            impact="agent cannot function until the provider is fixed",
+            critical=True,
+        )
+    # Resolve the base URL through the credential chain, not raw env vars: a
+    # ``custom`` provider keeps its endpoint in the encrypted vault and is
+    # deliberately never exported into the ambient env, so an env-only lookup
+    # reports a working provider as "base URL not set". This mirrors the path
+    # the runtime actually uses (``get_llm_credentials`` → vault → catalog).
+    base_url = get_llm_credentials(provider, model).get("base_url", "")
     proxy_label = ",".join(sorted(diagnostics.get("proxy", {}).keys())) or "none"
     diag_hint = (
         f"base={diagnostics['base_url']} "
@@ -324,7 +345,20 @@ def run_preflight(console: Optional[Console] = None) -> List[CheckResult]:
 
     results: List[CheckResult] = []
     for check_fn in checks:
-        results.append(check_fn())
+        try:
+            results.append(check_fn())
+        except Exception as exc:  # a diagnostic must never block startup
+            logger.warning(
+                "Preflight check %s crashed: %s", check_fn.__name__, exc, exc_info=True
+            )
+            results.append(
+                CheckResult(
+                    name=getattr(check_fn, "__name__", "check"),
+                    status="error",
+                    message=f"check crashed: {type(exc).__name__}: {exc}",
+                    impact="diagnostic unavailable; functionality not verified",
+                )
+            )
 
     # Build display table
     table = Table(show_header=False, show_edge=False, padding=(0, 1), expand=False)

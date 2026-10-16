@@ -3609,7 +3609,18 @@ def cmd_provider_doctor() -> int:
     """Print redacted provider diagnostics."""
     from src.providers.llm import provider_diagnostics
 
-    console.print_json(data=provider_diagnostics())
+    try:
+        diagnostics = provider_diagnostics()
+    except Exception as exc:  # a broken provider is a diagnosis, not a crash
+        console.print(
+            f"[red]Provider diagnostics unavailable:[/red] {type(exc).__name__}: {exc}"
+        )
+        console.print(
+            "[dim]Fix the active provider (Settings -> provider manager) or check "
+            "LANGCHAIN_PROVIDER/LANGCHAIN_MODEL_NAME.[/dim]"
+        )
+        return EXIT_RUN_FAILED
+    console.print_json(data=diagnostics)
     return EXIT_SUCCESS
 
 
