@@ -58,6 +58,65 @@ def test_source_prefixed_pair_rejected() -> None:
     assert "source prefix" in error.lower()
 
 
+def test_venue_symbols_pass_the_pair_guard() -> None:
+    """The guard must accept every spelling the loader layer routes.
+
+    ``GC=F`` (Yahoo continuous futures) is a real, priceable instrument; the
+    old ``isalnum()`` check refused it and told the model gold could not be
+    watched at all. Each case here mirrors a rule in
+    ``src.market_data._SOURCE_PATTERNS``.
+    """
+    for pair in (
+        "GC=F",
+        "CL=F",
+        "EURUSD=X",
+        "^SPX",
+        "AAPL.US",
+        "0700.HK",
+        "VOD.L",
+        "BTC-USDT",
+        "XAUUSD.FX",
+        "BTCUSDT",
+    ):
+        _, error = WatcherManagerTool._item_from_kwargs(_base(pair=pair))
+        assert error is None, f"{pair} should be a valid watcher pair: {error}"
+
+
+def test_malformed_pair_rejected_with_spelling_help() -> None:
+    _, error = WatcherManagerTool._item_from_kwargs(_base(pair="@@@"))
+    assert error is not None
+    assert "invalid_pair" in error
+    # The correction names the shapes that DO work, so a retry is not a guess.
+    assert "GC=F" in error
+
+
+def test_path_separator_rejected() -> None:
+    _, error = WatcherManagerTool._item_from_kwargs(_base(pair="../../etc/passwd"))
+    assert error is not None
+    assert "invalid_pair" in error
+
+
+def test_omitted_asset_class_is_inferred_from_the_symbol() -> None:
+    """GC=F is gold, not a coin. The label feeds the board card and wake prompt."""
+    cases = {
+        "GC=F": "commodity",
+        "CL=F": "commodity",
+        "ES=F": "index",
+        "EURUSD=X": "forex",
+        "XAUUSD=X": "commodity",
+        "^SPX": "index",
+        "AAPL.US": "equity",
+        "XAUUSD": "commodity",
+        "GBPJPY": "forex",
+        "BTCUSDT": "crypto",
+    }
+    for pair, expected in cases.items():
+        item, error = WatcherManagerTool._item_from_kwargs(_base(pair=pair))
+        assert error is None, f"{pair}: {error}"
+        assert item is not None
+        assert item.asset_class == expected, f"{pair} -> {item.asset_class}, expected {expected}"
+
+
 def test_unsupported_timeframe_rejected() -> None:
     _, error = WatcherManagerTool._item_from_kwargs(_base(timeframe="2h"))
     assert error is not None
@@ -122,6 +181,23 @@ def test_default_source_is_yfinance() -> None:
 def test_source_normalized_to_lowercase() -> None:
     assert normalize_source("OKX") == "okx"
     assert normalize_source("  Binance  ") == "binance"
+
+
+def test_failed_spot_metal_fetch_names_the_contract() -> None:
+    """An unpriceable spelling must say which spelling works.
+
+    ``XAUUSD`` has no yfinance series; the caller reported "this instrument
+    cannot be monitored" instead of retrying with ``GC=F``.
+    """
+    from src.watcher.market_data import _symbol_hint
+
+    assert "GC=F" in _symbol_hint("XAUUSD")
+    assert "XAUUSD=X" in _symbol_hint("XAUUSD")
+    assert "EURUSD=X" in _symbol_hint("EURUSD")
+    # A spelling already in loader form needs no correction.
+    assert _symbol_hint("GC=F") == ""
+    assert _symbol_hint("EURUSD=X") == ""
+    assert _symbol_hint("^SPX") == ""
 
 
 def test_omitted_source_defaults_to_yfinance() -> None:

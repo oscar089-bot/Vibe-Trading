@@ -31,6 +31,66 @@ from src.watcher.store import WatcherStore, default_watchers_dir
 #: of silently burning fetches (ported from OpenAlice's isServableBarInterval).
 SUPPORTED_WATCH_INTERVALS = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 
+#: Symbol shapes the market-data layer actually serves. Each entry mirrors a
+#: routing rule in :data:`src.market_data._SOURCE_PATTERNS`, so a token matching
+#: one is priceable by construction. The guard must therefore accept the
+#: punctuation those venues require — ``=F`` (Yahoo continuous futures), ``=X``
+#: (Yahoo FX), ``^`` (Yahoo indices), ``.`` (exchange suffixes) and ``-`` / ``/``
+#: (exchange crypto pairs). Treating them as "characters a symbol cannot carry"
+#: refused real instruments such as ``GC=F`` and told the model gold was
+#: unmonitorable. Every pattern is anchored and dot-free at the base, so no
+#: token can carry a path separator.
+_SYMBOL_SHAPES = (
+    re.compile(r"^\^[A-Z0-9][A-Z0-9.\-]*$"),                 # ^SPX, ^VIX
+    re.compile(r"^[A-Z0-9]{2,}=(F|X)$"),                     # GC=F, CL=F, EURUSD=X
+    re.compile(r"^[A-Z0-9][A-Z0-9&\-]*(\.[A-Z]{1,3})+$"),    # AAPL.US, 0700.HK, EURUSD.FX
+    re.compile(r"^[A-Z0-9]{2,}[-/][A-Z0-9]{2,}$"),           # BTC-USDT, XAU/USD
+    re.compile(r"^[A-Z0-9]{2,}$"),                            # AAPL, XAUUSD, BTCUSDT
+)
+
+#: Precious-metal base codes. A pair whose base is one of these quotes a metal,
+#: not a currency, so it is labelled a commodity rather than FX.
+_METAL_BASES = frozenset({"XAU", "XAG", "XPT", "XPD"})
+
+#: Yahoo continuous-futures roots that track an equity index rather than a
+#: physical commodity (ES=F S&P 500, NQ=F Nasdaq, YM=F Dow, RTY=F Russell).
+_INDEX_FUTURES_ROOTS = frozenset({"ES", "NQ", "YM", "RTY", "MES", "MNQ", "MYM", "M2K"})
+
+#: Precious metal -> Yahoo continuous-futures root, used to name the contract a
+#: failed spot fetch should have asked for (XAU -> GC=F).
+_METAL_FUTURES_ROOTS = {"XAU": "GC", "XAG": "SI", "XPT": "PL", "XPD": "PA"}
+
+
+def infer_asset_class(pair: str) -> str:
+    """Infer a watcher's asset class from its symbol spelling.
+
+    Used only when the model omits ``asset_class``. This is a label, not a
+    routing decision — :mod:`src.watcher.market_data` resolves the venue itself
+    — but the label is what the board card and the wake prompt show, so
+    ``GC=F`` must not be described as crypto.
+    """
+    token = str(pair or "").strip().upper()
+    if not token:
+        return "crypto"
+    if token.startswith("^"):
+        return "index"
+    if token.endswith("=F"):
+        root = token[:-2]
+        return "index" if root in _INDEX_FUTURES_ROOTS else "commodity"
+    if token.endswith("=X"):
+        return "commodity" if token[:3] in _METAL_BASES else "forex"
+    if token.endswith(".FX"):
+        return "commodity" if token[:-3][:3] in _METAL_BASES else "forex"
+    if "." in token:
+        return "equity"
+    for separator in ("/", "-"):
+        if separator in token:
+            base = token.split(separator, 1)[0]
+            return "commodity" if base in _METAL_BASES else "crypto"
+    if len(token) == 6 and token.isalpha():
+        return "commodity" if token[:3] in _METAL_BASES else "forex"
+    return "crypto"
+
 
 class WatcherManagerTool(BaseTool):
     """List and mutate persistent market watchers."""
@@ -43,7 +103,10 @@ class WatcherManagerTool(BaseTool):
         "the same deterministic trigger; use a new next-condition trigger or leave VALID setups as triggered history. "
         "For multi-step plans such as 'retest zone, reject, then candle close', arm only the next unmet step.\n\n"
         "A COMPLETE watcher needs ALL of these or creation is rejected with a correction:\n"
-        "  1. pair: the bare symbol only (BTCUSDT, GBPJPY, AAPL). NEVER prefix a source (not 'yfinance|SOLUSD').\n"
+        "  1. pair: the bare symbol only (BTCUSDT, GBPJPY, AAPL, GC=F). NEVER prefix a source "
+        "(not 'yfinance|SOLUSD'). Yahoo venue conventions are accepted as written: '=F' continuous "
+        "futures (GC=F, CL=F), '=X' FX (EURUSD=X, XAUUSD=X), '^' indices (^SPX), exchange suffixes "
+        "(AAPL.US, 0700.HK, VOD.L) and 'XAUUSD.FX' for MT5/tickerall metals.\n"
         "  2. asset_class: crypto | forex | equity | commodity | index.\n"
         "  3. direction: LONG or SHORT.\n"
         "  4. timeframe: one of 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w (omit to default to 1d). A timeframe outside "
@@ -607,14 +670,19 @@ class WatcherManagerTool(BaseTool):
             )
         if any(ch.isspace() for ch in clean):
             return f"invalid_pair: {clean!r} contains whitespace. Pass a single symbol token."
-        normalized = clean.upper().replace("/", "").replace("-", "").replace("_", "")
-        if not normalized.isalnum():
+        if ".." in clean or "\\" in clean:
             return (
-                f"invalid_pair: {clean!r} has characters a symbol cannot carry. "
-                f"Use letters/digits only, e.g. 'BTCUSDT'."
+                f"invalid_pair: {clean!r} contains a path separator. Pass a symbol token, "
+                f"e.g. 'GC=F' or 'AAPL.US'."
             )
-        if len(normalized) < 3:
-            return f"invalid_pair: {clean!r} is too short to be a tradable symbol."
+        token = clean.upper()
+        if not any(shape.match(token) for shape in _SYMBOL_SHAPES):
+            return (
+                f"invalid_pair: {clean!r} is not a symbol shape the market-data layer serves. "
+                f"Accepted spellings: bare ticker (BTCUSDT, AAPL, XAUUSD), Yahoo continuous futures "
+                f"(GC=F, CL=F), Yahoo FX (EURUSD=X, XAUUSD=X), Yahoo index (^SPX), exchange suffix "
+                f"(AAPL.US, 0700.HK, VOD.L, EURUSD.FX) and crypto pair (BTC-USDT, BTC/USDT)."
+            )
         return None
 
     @staticmethod
@@ -873,8 +941,9 @@ class WatcherManagerTool(BaseTool):
         raw = str(payload.get("asset_class") or "").strip().lower()
         if raw in {"crypto", "forex", "equity", "commodity", "index"}:
             return raw
-        pair = str(payload.get("pair") or "").strip().upper().replace("/", "").replace("-", "")
-        return "forex" if len(pair) == 6 and pair.isalpha() else "crypto"
+        # Omitted: infer from the symbol rather than defaulting everything that
+        # is not a 6-letter FX pair to crypto. GC=F is gold, not a coin.
+        return infer_asset_class(str(payload.get("pair") or ""))
 
     @staticmethod
     def _source_from_payload(payload: dict[str, Any]) -> str:

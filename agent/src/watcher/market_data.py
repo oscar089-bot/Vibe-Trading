@@ -132,6 +132,35 @@ def _date_window(timeframe: str, *, bars: int = _DEFAULT_BARS) -> tuple[str, str
     return start, end
 
 
+#: Precious-metal base codes and the Yahoo continuous-futures root that tracks
+#: the same metal. yfinance exposes no bare ``XAUUSD``; the contract is ``GC=F``.
+_METAL_FUTURES_ROOTS = {"XAU": "GC", "XAG": "SI", "XPT": "PL", "XPD": "PA"}
+
+
+def _symbol_hint(pair: str) -> str:
+    """Return a correction hint naming a spelling the loader layer can price.
+
+    A failed fetch of ``XAUUSD`` or ``EURUSD`` used to read as "no market data",
+    which the caller reasonably reported as "this instrument cannot be
+    monitored". The instrument is fine; the spelling is not. yfinance serves the
+    continuous contract as ``GC=F`` and the FX pair as ``EURUSD=X``, so name it.
+    """
+    token = str(pair or "").strip().upper()
+    bare = token.replace("/", "").replace("-", "").replace("_", "")
+    if token.endswith(("=F", "=X", ".FX")) or "^" in token:
+        return ""
+    if len(bare) == 6 and bare.isalpha():
+        base = bare[:3]
+        root = _METAL_FUTURES_ROOTS.get(base)
+        if root:
+            return (
+                f" {pair!r} is a spot metal; yfinance exposes the continuous contract "
+                f"as {root}=F (and the FX cross as {bare}=X). Retry with one of those."
+            )
+        return f" {pair!r} looks like an FX pair; yfinance spells it {bare}=X."
+    return ""
+
+
 def _candle_from_row(timestamp: Any, row: Any, timeframe: str, *, now: datetime) -> dict[str, Any]:
     """Build one candle dict from a DataFrame row."""
     if isinstance(timestamp, datetime):
@@ -203,16 +232,17 @@ class RoutedMarketDataProvider:
             include_provenance=True,
             as_frames=True,
         )
+        hint = _symbol_hint(pair)
         if pair in payload.get("_unresolved", []):
             raise RuntimeError(
                 f"no market data for {pair!r} "
-                f"(timeframe={normalized_tf or _DEFAULT_INTERVAL}, source={resolved_source})"
+                f"(timeframe={normalized_tf or _DEFAULT_INTERVAL}, source={resolved_source}).{hint}"
             )
         frame = payload.get(pair)
         if frame is None or getattr(frame, "empty", True):
             raise RuntimeError(
                 f"no market data for {pair!r} "
-                f"(timeframe={normalized_tf or _DEFAULT_INTERVAL}, source={resolved_source})"
+                f"(timeframe={normalized_tf or _DEFAULT_INTERVAL}, source={resolved_source}).{hint}"
             )
 
         now = datetime.now(timezone.utc)
